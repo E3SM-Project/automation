@@ -11,6 +11,9 @@ on:
     - cron: '0 8 * * *'
   workflow_dispatch: # Allows running manually from GitHub UI
 
+permissions:
+  contents: read
+
 jobs:
   report-usage:
     runs-on: ubuntu-latest
@@ -24,71 +27,127 @@ jobs:
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
       # 2. Query GitHub Billing API and Post Report to Slack
       - name: Fetch Metrics and Post to Slack
-        uses: actions/github-script@v7
         env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
           ORG_NAME: ${{ github.repository_owner }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        with:
-          github-token: ${{ steps.generate-token.outputs.token }}
-          script: |
-            const org = process.env.ORG_NAME;
-            const slackWebhook = process.env.SLACK_WEBHOOK_URL;
+          # Configured based on the org's "Copilot" settings in the GitHub UI
+          INCLUDED_CREDITS_CAP: "85500"
+          ADDITIONAL_BUDGET_CAP: "1500.00"
+        run: |
+          python3 - << 'EOF'
+          import os
+          import sys
+          from datetime import datetime, timezone
 
-            let usageDetails = "";
+          import requests
 
-            // Helper to format currency
-            const formatUSD = (val) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(val || 0);
+          gh_token = os.environ["GH_TOKEN"]
+          org_name = os.environ["ORG_NAME"]
+          webhook_url = os.environ["SLACK_WEBHOOK_URL"]
+          included_cap = float(os.environ.get("INCLUDED_CREDITS_CAP", "85500"))
+          budget_cap = float(os.environ.get("ADDITIONAL_BUDGET_CAP", "1500.00"))
 
-            try {
-              // Attempt 1: Fetch Enterprise / Org Budget status
-              const response = await github.request('GET /orgs/{org}/settings/billing/summary', {
-                org: org,
-                headers: { 'X-GitHub-Api-Version': '2022-11-28' }
-              });
+          headers = {
+              "Authorization": f"Bearer {gh_token}",
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+          }
 
-              const data = response.data;
-              const used = formatUSD(data.total_amount_spent);
-              const budget = data.budget_limit ? formatUSD(data.budget_limit) : "Unlimited";
-              
-              let pctStr = "";
-              if (data.budget_limit && data.budget_limit > 0) {
-                pctStr = " (" + ((data.total_amount_spent / data.budget_limit) * 100).toFixed(1) + "% used)";
-              }
+          def post_slack(payload):
+              res = requests.post(webhook_url, json=payload, timeout=10)
+              res.raise_for_status()
 
-              usageDetails = "AI Credit Usage: " + used + " / " + budget + pctStr;
+          # Fetch all pages of the org's billing usage report
+          usage_items = []
+          url = f"https://api.github.com/orgs/{org_name}/settings/billing/usage"
+          try:
+              while url:
+                  response = requests.get(url, headers=headers, timeout=15)
+                  response.raise_for_status()
+                  usage_items.extend(response.json().get("usageItems", []))
+                  url = response.links.get("next", {}).get("url")
+          except requests.RequestException as exc:
+              post_slack({"text": f":red_circle: Daily AI usage report failed to fetch billing data for `{org_name}`: {exc}"})
+              sys.exit(1)
 
-            } catch (err) {
-              console.log("Org-level billing API error:", err.message);
+          if not usage_items:
+              post_slack({
+                  "text": (
+                      f":warning: Daily AI usage report for `{org_name}` got an empty usage response. "
+                      "Check the GitHub App's Administration (read) permission and installation scope."
+                  )
+              })
+              sys.exit(1)
 
-              // Attempt 2: Fallback for Enterprise Billing API endpoint
-              try {
-                const entResp = await github.request('GET /enterprises/{enterprise}/settings/billing/summary', {
-                  enterprise: org,
-                  headers: { 'X-GitHub-Api-Version': '2022-11-28' }
-                });
+          current_month_prefix = datetime.now(timezone.utc).strftime("%Y-%m")
 
-                const data = entResp.data;
-                usageDetails = "Enterprise Billing Usage: " + formatUSD(data.total_gross_amount) + " / " + formatUSD(data.budget_limit);
-              } catch (entErr) {
-                console.log("Enterprise-level billing API error:", entErr.message);
-                usageDetails = "Notice: Unable to access billing API directly. Ensure the GitHub App has 'Enterprise Billing: Read-Only' permissions.";
-              }
-            }
+          used_credits = 0.0
+          used_additional_dollars = 0.0
+          for item in usage_items:
+              item_date = item.get("date", "")
+              product = item.get("product", "")
+              if item_date.startswith(current_month_prefix) and product == "copilot":
+                  used_credits += item.get("quantity", 0.0)
+                  used_additional_dollars += item.get("netAmount", 0.0)
 
-            // Construct formatted Slack message
-            const slackPayload = {
-              text: "Daily Usage Report for " + org + ":\n\n" + usageDetails
-            };
+          base_credits_used = min(used_credits, included_cap)
+          base_pct = (base_credits_used / included_cap) * 100.0 if included_cap > 0 else 0.0
+          additional_pct = (used_additional_dollars / budget_cap) * 100.0 if budget_cap > 0 else 0.0
 
-            // Post to Slack Webhook
-            const res = await fetch(slackWebhook, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(slackPayload)
-            });
+          if used_additional_dollars > budget_cap:
+              status_emoji = ":red_circle:"
+              status_text = f"*Status:* BUDGET EXCEEDED (Over by ${used_additional_dollars - budget_cap:,.2f})"
+          elif additional_pct >= 85.0:
+              status_emoji = ":warning:"
+              status_text = "*Status:* Warning - Additional budget over 85% depleted"
+          else:
+              status_emoji = ":large_green_circle:"
+              status_text = "*Status:* Normal"
 
-            if (!res.ok) {
-              throw new Error("Slack post failed with status " + res.status + ": " + res.statusText);
-            }
+          slack_payload = {
+              "blocks": [
+                  {
+                      "type": "header",
+                      "text": {
+                          "type": "plain_text",
+                          "text": f"AI Credit Status - {org_name} ({datetime.now(timezone.utc).strftime('%B %Y')})",
+                      },
+                  },
+                  {
+                      "type": "section",
+                      "text": {
+                          "type": "mrkdwn",
+                          "text": (
+                              f"{status_emoji} {status_text}\n\n"
+                              f"* *Included Credits:* {base_credits_used:,.0f} / {included_cap:,.0f} ({base_pct:.1f}%)\n"
+                              f"* *Additional Budget:* ${used_additional_dollars:,.2f} / ${budget_cap:,.2f} ({additional_pct:.1f}%)"
+                          ),
+                      },
+                  },
+                  {
+                      "type": "context",
+                      "elements": [
+                          {"type": "mrkdwn", "text": "Automated daily report generated via GitHub Actions."}
+                      ],
+                  },
+              ]
+          }
+
+          post_slack(slack_payload)
+          print("Successfully posted report to Slack!")
+          print(f"Included Credits:  {base_credits_used:,.0f} / {included_cap:,.0f} credits ({base_pct:.1f}%)")
+          print(f"Additional Budget: ${used_additional_dollars:,.2f} / ${budget_cap:,.2f} ({additional_pct:.1f}%)")
+          EOF
