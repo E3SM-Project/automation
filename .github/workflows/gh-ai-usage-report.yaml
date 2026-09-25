@@ -27,9 +27,6 @@ jobs:
     env:
       ORG_NAME: ${{ github.repository_owner }}
       SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-      # Configured based on the org's "Copilot" settings in the GitHub UI
-      INCLUDED_CREDITS_CAP: "85500"
-      ADDITIONAL_BUDGET_CAP: "1500.00"
     steps:
       # 1. Mint short-lived installation token from your GitHub App
       - name: Generate GitHub App Token
@@ -50,8 +47,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      # 2. Query the GitHub Billing API only. Sets used_credits /
-      #    used_additional_dollars as step outputs, doesn't touch Slack.
+      # 2. Query the GitHub Billing API only. Sets included/additional
+      #    usage and their caps as step outputs, doesn't touch Slack.
       - name: Fetch usage from GitHub Billing API
         id: fetch-usage
         env:
@@ -73,21 +70,29 @@ jobs:
               "X-GitHub-Api-Version": "2022-11-28",
           }
 
+          def get_paginated(url, list_key):
+              items = []
+              try:
+                  while url:
+                      response = requests.get(url, headers=headers, timeout=15)
+                      response.raise_for_status()
+                      items.extend(response.json().get(list_key, []))
+                      url = response.links.get("next", {}).get("url")
+              except requests.RequestException as exc:
+                  print(f"::error::GET {url} failed: {exc}")
+                  sys.exit(1)
+              return items
+
           current_month_prefix = datetime.now(timezone.utc).strftime("%Y-%m")
 
-          # Fetch all pages of the org's billing usage report
-          usage_items = []
-          url = f"https://api.github.com/orgs/{org_name}/settings/billing/usage"
-          try:
-              while url:
-                  response = requests.get(url, headers=headers, timeout=15)
-                  response.raise_for_status()
-                  usage_items.extend(response.json().get("usageItems", []))
-                  url = response.links.get("next", {}).get("url")
-          except requests.RequestException as exc:
-              print(f"::error::Failed to fetch billing usage for `{org_name}`: {exc}")
-              sys.exit(1)
-
+          # 1. Usage line items: discountAmount is the $ portion covered by
+          # the included AI-credit pool, netAmount is what was actually
+          # billed as overage. "UserMonths"-billed items are flat per-seat
+          # subscription fees (not AI credit consumption), so they're
+          # excluded from both sums - only usage-billed SKUs count.
+          usage_items = get_paginated(
+              f"https://api.github.com/orgs/{org_name}/settings/billing/usage", "usageItems"
+          )
           if not usage_items:
               print(
                   f"::error::Billing usage API returned no usageItems for `{org_name}`. "
@@ -95,20 +100,82 @@ jobs:
               )
               sys.exit(1)
 
-          used_credits = 0.0
+          included_dollars_used = 0.0
           used_additional_dollars = 0.0
           for item in usage_items:
-              item_date = item.get("date", "")
-              product = item.get("product", "")
-              if item_date.startswith(current_month_prefix) and product == "copilot":
-                  used_credits += item.get("quantity", 0.0)
-                  used_additional_dollars += item.get("netAmount", 0.0)
+              if item.get("product") != "copilot" or item.get("unitType") == "UserMonths":
+                  continue
+              if not item.get("date", "").startswith(current_month_prefix):
+                  continue
+              included_dollars_used += item.get("discountAmount", 0.0)
+              used_additional_dollars += item.get("netAmount", 0.0)
 
-          print(f"Raw totals: used_credits={used_credits}, used_additional_dollars={used_additional_dollars}")
+          included_credits_used = included_dollars_used * 100  # 1 AI credit = $0.01
+
+          # 2. Included-credit pool size = seat count * per-seat monthly
+          # credit allotment. GitHub doesn't expose the pool total directly,
+          # so it's derived here; update PER_SEAT_CREDITS if GitHub changes
+          # a plan's allotment or E3SM changes plans.
+          PER_SEAT_CREDITS = {
+              "business": 1900,
+              "enterprise": 3900,
+          }
+          seats_res = requests.get(
+              f"https://api.github.com/orgs/{org_name}/copilot/billing", headers=headers, timeout=15
+          )
+          try:
+              seats_res.raise_for_status()
+          except requests.RequestException as exc:
+              print(f"::error::Failed to fetch Copilot seat info for `{org_name}`: {exc}")
+              sys.exit(1)
+
+          seat_data = seats_res.json()
+          plan_type = seat_data.get("plan_type")
+          seat_count = seat_data.get("seat_breakdown", {}).get("total")
+          if plan_type not in PER_SEAT_CREDITS or seat_count is None:
+              print(
+                  f"::error::Unrecognized Copilot plan_type={plan_type!r} or missing seat count "
+                  f"for `{org_name}` - add the plan to PER_SEAT_CREDITS."
+              )
+              sys.exit(1)
+
+          included_credits_cap = seat_count * PER_SEAT_CREDITS[plan_type]
+
+          # 3. Additional budget cap: read the org-level "copilot"
+          # ProductPricing budget - the "Edit budget" cap set in the
+          # GitHub UI - instead of hardcoding it.
+          budgets = get_paginated(
+              f"https://api.github.com/orgs/{org_name}/settings/billing/budgets", "budgets"
+          )
+          additional_budget_cap = next(
+              (
+                  b.get("budget_amount")
+                  for b in budgets
+                  if b.get("budget_type") == "ProductPricing"
+                  and b.get("budget_product_sku") == "copilot"
+                  and b.get("budget_scope") == "organization"
+              ),
+              None,
+          )
+          if additional_budget_cap is None:
+              print(
+                  f"::error::No org-level ProductPricing/copilot budget found for `{org_name}` - "
+                  "was it renamed or removed in the GitHub UI?"
+              )
+              sys.exit(1)
+
+          print(
+              f"Raw totals: included_credits_used={included_credits_used}, "
+              f"included_credits_cap={included_credits_cap}, "
+              f"used_additional_dollars={used_additional_dollars}, "
+              f"additional_budget_cap={additional_budget_cap}"
+          )
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"used_credits={used_credits}\n")
+              f.write(f"included_credits_used={included_credits_used}\n")
+              f.write(f"included_credits_cap={included_credits_cap}\n")
               f.write(f"used_additional_dollars={used_additional_dollars}\n")
+              f.write(f"additional_budget_cap={additional_budget_cap}\n")
           EOF
 
       # 3. Sanity-check that the values crossing the step boundary are
@@ -119,8 +186,10 @@ jobs:
       - name: Validate usage numbers
         id: validate-usage
         env:
-          USED_CREDITS: ${{ steps.fetch-usage.outputs.used_credits }}
+          INCLUDED_CREDITS_USED: ${{ steps.fetch-usage.outputs.included_credits_used }}
+          INCLUDED_CREDITS_CAP: ${{ steps.fetch-usage.outputs.included_credits_cap }}
           USED_ADDITIONAL_DOLLARS: ${{ steps.fetch-usage.outputs.used_additional_dollars }}
+          ADDITIONAL_BUDGET_CAP: ${{ steps.fetch-usage.outputs.additional_budget_cap }}
         run: |
           python3 - << 'EOF'
           import math
@@ -141,10 +210,20 @@ jobs:
                   sys.exit(1)
               return value
 
-          used_credits = validate("used_credits", os.environ["USED_CREDITS"])
-          used_additional_dollars = validate("used_additional_dollars", os.environ["USED_ADDITIONAL_DOLLARS"])
+          values = {
+              name: validate(name, os.environ[name])
+              for name in (
+                  "INCLUDED_CREDITS_USED",
+                  "INCLUDED_CREDITS_CAP",
+                  "USED_ADDITIONAL_DOLLARS",
+                  "ADDITIONAL_BUDGET_CAP",
+              )
+          }
+          if values["INCLUDED_CREDITS_CAP"] == 0 or values["ADDITIONAL_BUDGET_CAP"] == 0:
+              print(f"::error::A cap came back as 0, which should not happen: {values}")
+              sys.exit(1)
 
-          print(f"OK: used_credits={used_credits}, used_additional_dollars={used_additional_dollars}")
+          print(f"OK: {values}")
           EOF
 
       # 4. Craft the Slack Block Kit message and post it. Skipped on PR
@@ -152,8 +231,10 @@ jobs:
       - name: Craft and post Slack message
         if: github.event_name != 'pull_request'
         env:
-          USED_CREDITS: ${{ steps.fetch-usage.outputs.used_credits }}
+          INCLUDED_CREDITS_USED: ${{ steps.fetch-usage.outputs.included_credits_used }}
+          INCLUDED_CREDITS_CAP: ${{ steps.fetch-usage.outputs.included_credits_cap }}
           USED_ADDITIONAL_DOLLARS: ${{ steps.fetch-usage.outputs.used_additional_dollars }}
+          ADDITIONAL_BUDGET_CAP: ${{ steps.fetch-usage.outputs.additional_budget_cap }}
         run: |
           python3 - << 'EOF'
           import os
@@ -163,12 +244,12 @@ jobs:
 
           org_name = os.environ["ORG_NAME"]
           webhook_url = os.environ["SLACK_WEBHOOK_URL"]
-          included_cap = float(os.environ.get("INCLUDED_CREDITS_CAP", "85500"))
-          budget_cap = float(os.environ.get("ADDITIONAL_BUDGET_CAP", "1500.00"))
-          used_credits = float(os.environ["USED_CREDITS"])
+          included_credits_used = float(os.environ["INCLUDED_CREDITS_USED"])
+          included_cap = float(os.environ["INCLUDED_CREDITS_CAP"])
           used_additional_dollars = float(os.environ["USED_ADDITIONAL_DOLLARS"])
+          budget_cap = float(os.environ["ADDITIONAL_BUDGET_CAP"])
 
-          base_credits_used = min(used_credits, included_cap)
+          base_credits_used = min(included_credits_used, included_cap)
           base_pct = (base_credits_used / included_cap) * 100.0 if included_cap > 0 else 0.0
           additional_pct = (used_additional_dollars / budget_cap) * 100.0 if budget_cap > 0 else 0.0
 
@@ -188,7 +269,7 @@ jobs:
                       "type": "header",
                       "text": {
                           "type": "plain_text",
-                          "text": f"AI Credit Status - {org_name} ({datetime.now(timezone.utc).strftime('%B %Y')})",
+                          "text": f"{org_name} GitHub AI usage report",
                       },
                   },
                   {
@@ -197,7 +278,7 @@ jobs:
                           "type": "mrkdwn",
                           "text": (
                               f"{status_emoji} {status_text}\n\n"
-                              f"* *Included Credits:* {base_credits_used:,.0f} / {included_cap:,.0f} ({base_pct:.1f}%)\n"
+                              f"* *Included Credits:* {base_credits_used:,.0f} / {included_cap:,.0f} credits ({base_pct:.1f}%)\n"
                               f"* *Additional Budget:* ${used_additional_dollars:,.2f} / ${budget_cap:,.2f} ({additional_pct:.1f}%)"
                           ),
                       },
