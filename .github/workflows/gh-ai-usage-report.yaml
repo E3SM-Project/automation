@@ -4,16 +4,29 @@ name: AI Usage Report
 # with proper read privileges) to get the current status of our ai credits
 # usage. Then, it crafts and posts a message on the general-e3sm slack
 # channel on e3sm-project.slack.com
+#
+# It also runs (fetch + validate steps only, no Slack post) on any PR that
+# touches this file, as a check that the REST calls still succeed and that
+# the numbers they produce still parse as numbers.
 
 on:
   schedule:
     # Runs daily at 08:00 AM UTC
     - cron: '0 8 * * *'
   workflow_dispatch: # Allows running manually from GitHub UI
+  pull_request:
+    paths:
+      - '.github/workflows/gh-ai-usage-report.yaml'
+
+permissions:
+  contents: read
 
 jobs:
   report-usage:
     runs-on: ubuntu-latest
+    env:
+      ORG_NAME: ${{ github.repository_owner }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
     steps:
       # 1. Mint short-lived installation token from your GitHub App
       - name: Generate GitHub App Token
@@ -24,71 +37,274 @@ jobs:
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
 
-      # 2. Query GitHub Billing API and Post Report to Slack
-      - name: Fetch Metrics and Post to Slack
-        uses: actions/github-script@v7
-        env:
-          ORG_NAME: ${{ github.repository_owner }}
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          github-token: ${{ steps.generate-token.outputs.token }}
-          script: |
-            const org = process.env.ORG_NAME;
-            const slackWebhook = process.env.SLACK_WEBHOOK_URL;
+          python-version: '3.11'
 
-            let usageDetails = "";
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
 
-            // Helper to format currency
-            const formatUSD = (val) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(val || 0);
+      # 2. Query the GitHub Billing API only. Sets included/additional
+      #    usage and their caps as step outputs, doesn't touch Slack.
+      - name: Fetch usage from GitHub Billing API
+        id: fetch-usage
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+        run: |
+          python3 - << 'EOF'
+          import os
+          import sys
+          from datetime import datetime, timezone
 
-            try {
-              // Attempt 1: Fetch Enterprise / Org Budget status
-              const response = await github.request('GET /orgs/{org}/settings/billing/summary', {
-                org: org,
-                headers: { 'X-GitHub-Api-Version': '2022-11-28' }
-              });
+          import requests
 
-              const data = response.data;
-              const used = formatUSD(data.total_amount_spent);
-              const budget = data.budget_limit ? formatUSD(data.budget_limit) : "Unlimited";
-              
-              let pctStr = "";
-              if (data.budget_limit && data.budget_limit > 0) {
-                pctStr = " (" + ((data.total_amount_spent / data.budget_limit) * 100).toFixed(1) + "% used)";
-              }
+          gh_token = os.environ["GH_TOKEN"]
+          org_name = os.environ["ORG_NAME"]
 
-              usageDetails = "AI Credit Usage: " + used + " / " + budget + pctStr;
+          headers = {
+              "Authorization": f"Bearer {gh_token}",
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+          }
 
-            } catch (err) {
-              console.log("Org-level billing API error:", err.message);
+          def get_paginated(url, list_key):
+              items = []
+              try:
+                  while url:
+                      response = requests.get(url, headers=headers, timeout=15)
+                      response.raise_for_status()
+                      items.extend(response.json().get(list_key, []))
+                      url = response.links.get("next", {}).get("url")
+              except requests.RequestException as exc:
+                  print(f"::error::GET {url} failed: {exc}")
+                  sys.exit(1)
+              return items
 
-              // Attempt 2: Fallback for Enterprise Billing API endpoint
-              try {
-                const entResp = await github.request('GET /enterprises/{enterprise}/settings/billing/summary', {
-                  enterprise: org,
-                  headers: { 'X-GitHub-Api-Version': '2022-11-28' }
-                });
+          current_month_prefix = datetime.now(timezone.utc).strftime("%Y-%m")
 
-                const data = entResp.data;
-                usageDetails = "Enterprise Billing Usage: " + formatUSD(data.total_gross_amount) + " / " + formatUSD(data.budget_limit);
-              } catch (entErr) {
-                console.log("Enterprise-level billing API error:", entErr.message);
-                usageDetails = "Notice: Unable to access billing API directly. Ensure the GitHub App has 'Enterprise Billing: Read-Only' permissions.";
-              }
-            }
+          # 1. Usage line items: discountAmount is the $ portion covered by
+          # the included AI-credit pool, netAmount is what was actually
+          # billed as overage. "UserMonths"-billed items are flat per-seat
+          # subscription fees (not AI credit consumption), so they're
+          # excluded from both sums - only usage-billed SKUs count.
+          usage_items = get_paginated(
+              f"https://api.github.com/orgs/{org_name}/settings/billing/usage", "usageItems"
+          )
+          if not usage_items:
+              print(
+                  f"::error::Billing usage API returned no usageItems for `{org_name}`. "
+                  "Check the GitHub App's Administration (read) permission and installation scope."
+              )
+              sys.exit(1)
 
-            // Construct formatted Slack message
-            const slackPayload = {
-              text: "Daily Usage Report for " + org + ":\n\n" + usageDetails
-            };
+          included_dollars_used = 0.0
+          used_additional_dollars = 0.0
+          for item in usage_items:
+              if item.get("product") != "copilot" or item.get("unitType") == "UserMonths":
+                  continue
+              if not item.get("date", "").startswith(current_month_prefix):
+                  continue
+              included_dollars_used += item.get("discountAmount", 0.0)
+              used_additional_dollars += item.get("netAmount", 0.0)
 
-            // Post to Slack Webhook
-            const res = await fetch(slackWebhook, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(slackPayload)
-            });
+          included_credits_used = included_dollars_used * 100  # 1 AI credit = $0.01
 
-            if (!res.ok) {
-              throw new Error("Slack post failed with status " + res.status + ": " + res.statusText);
-            }
+          # 2. Included-credit pool size = seat count * per-seat monthly
+          # credit allotment. GitHub doesn't expose the pool total directly,
+          # so it's derived here; update PER_SEAT_CREDITS if GitHub changes
+          # a plan's allotment or E3SM changes plans.
+          PER_SEAT_CREDITS = {
+              "business": 1900,
+              "enterprise": 3900,
+          }
+          seats_res = requests.get(
+              f"https://api.github.com/orgs/{org_name}/copilot/billing", headers=headers, timeout=15
+          )
+          try:
+              seats_res.raise_for_status()
+          except requests.RequestException as exc:
+              print(f"::error::Failed to fetch Copilot seat info for `{org_name}`: {exc}")
+              sys.exit(1)
+
+          seat_data = seats_res.json()
+          plan_type = seat_data.get("plan_type")
+          seat_count = seat_data.get("seat_breakdown", {}).get("total")
+          if plan_type not in PER_SEAT_CREDITS or seat_count is None:
+              print(
+                  f"::error::Unrecognized Copilot plan_type={plan_type!r} or missing seat count "
+                  f"for `{org_name}` - add the plan to PER_SEAT_CREDITS."
+              )
+              sys.exit(1)
+
+          included_credits_cap = seat_count * PER_SEAT_CREDITS[plan_type]
+
+          # 3. Additional budget cap: read the org-level "copilot"
+          # ProductPricing budget - the "Edit budget" cap set in the
+          # GitHub UI - instead of hardcoding it.
+          budgets = get_paginated(
+              f"https://api.github.com/orgs/{org_name}/settings/billing/budgets", "budgets"
+          )
+          additional_budget_cap = next(
+              (
+                  b.get("budget_amount")
+                  for b in budgets
+                  if b.get("budget_type") == "ProductPricing"
+                  and b.get("budget_product_sku") == "copilot"
+                  and b.get("budget_scope") == "organization"
+              ),
+              None,
+          )
+          if additional_budget_cap is None:
+              print(
+                  f"::error::No org-level ProductPricing/copilot budget found for `{org_name}` - "
+                  "was it renamed or removed in the GitHub UI?"
+              )
+              sys.exit(1)
+
+          print(
+              f"Raw totals: included_credits_used={included_credits_used}, "
+              f"included_credits_cap={included_credits_cap}, "
+              f"used_additional_dollars={used_additional_dollars}, "
+              f"additional_budget_cap={additional_budget_cap}"
+          )
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"included_credits_used={included_credits_used}\n")
+              f.write(f"included_credits_cap={included_credits_cap}\n")
+              f.write(f"used_additional_dollars={used_additional_dollars}\n")
+              f.write(f"additional_budget_cap={additional_budget_cap}\n")
+          EOF
+
+      # 3. Sanity-check that the values crossing the step boundary are
+      #    actually numbers (GitHub Actions step outputs are always plain
+      #    strings, so a REST field rename or type change upstream would
+      #    otherwise only show up as a garbled Slack message). Runs on
+      #    every trigger, including PRs.
+      - name: Validate usage numbers
+        id: validate-usage
+        env:
+          INCLUDED_CREDITS_USED: ${{ steps.fetch-usage.outputs.included_credits_used }}
+          INCLUDED_CREDITS_CAP: ${{ steps.fetch-usage.outputs.included_credits_cap }}
+          USED_ADDITIONAL_DOLLARS: ${{ steps.fetch-usage.outputs.used_additional_dollars }}
+          ADDITIONAL_BUDGET_CAP: ${{ steps.fetch-usage.outputs.additional_budget_cap }}
+        run: |
+          python3 - << 'EOF'
+          import math
+          import os
+          import sys
+
+          def validate(name, raw_value):
+              try:
+                  value = float(raw_value)
+              except (TypeError, ValueError):
+                  print(f"::error::{name} is not a valid number: {raw_value!r}")
+                  sys.exit(1)
+              if math.isnan(value) or math.isinf(value):
+                  print(f"::error::{name} is not a finite number: {raw_value!r}")
+                  sys.exit(1)
+              if value < 0:
+                  print(f"::error::{name} is negative, which should not happen: {value}")
+                  sys.exit(1)
+              return value
+
+          values = {
+              name: validate(name, os.environ[name])
+              for name in (
+                  "INCLUDED_CREDITS_USED",
+                  "INCLUDED_CREDITS_CAP",
+                  "USED_ADDITIONAL_DOLLARS",
+                  "ADDITIONAL_BUDGET_CAP",
+              )
+          }
+          if values["INCLUDED_CREDITS_CAP"] == 0 or values["ADDITIONAL_BUDGET_CAP"] == 0:
+              print(f"::error::A cap came back as 0, which should not happen: {values}")
+              sys.exit(1)
+
+          print(f"OK: {values}")
+          EOF
+
+      # 4. Craft the Slack Block Kit message and post it. Skipped on PR
+      #    runs - those only need steps 2-3 to pass as a check.
+      - name: Craft and post Slack message
+        if: github.event_name != 'pull_request'
+        env:
+          INCLUDED_CREDITS_USED: ${{ steps.fetch-usage.outputs.included_credits_used }}
+          INCLUDED_CREDITS_CAP: ${{ steps.fetch-usage.outputs.included_credits_cap }}
+          USED_ADDITIONAL_DOLLARS: ${{ steps.fetch-usage.outputs.used_additional_dollars }}
+          ADDITIONAL_BUDGET_CAP: ${{ steps.fetch-usage.outputs.additional_budget_cap }}
+        run: |
+          python3 - << 'EOF'
+          import os
+          from datetime import datetime, timezone
+
+          import requests
+
+          org_name = os.environ["ORG_NAME"]
+          webhook_url = os.environ["SLACK_WEBHOOK_URL"]
+          included_credits_used = float(os.environ["INCLUDED_CREDITS_USED"])
+          included_cap = float(os.environ["INCLUDED_CREDITS_CAP"])
+          used_additional_dollars = float(os.environ["USED_ADDITIONAL_DOLLARS"])
+          budget_cap = float(os.environ["ADDITIONAL_BUDGET_CAP"])
+
+          base_credits_used = min(included_credits_used, included_cap)
+          base_pct = (base_credits_used / included_cap) * 100.0 if included_cap > 0 else 0.0
+          additional_pct = (used_additional_dollars / budget_cap) * 100.0 if budget_cap > 0 else 0.0
+
+          if used_additional_dollars > budget_cap:
+              status_emoji = ":red_circle:"
+              status_text = f"*Status:* BUDGET EXCEEDED (Over by ${used_additional_dollars - budget_cap:,.2f})"
+          elif additional_pct >= 85.0:
+              status_emoji = ":warning:"
+              status_text = "*Status:* Warning - Additional budget over 85% depleted"
+          else:
+              status_emoji = ":large_green_circle:"
+              status_text = "*Status:* Normal"
+
+          slack_payload = {
+              "blocks": [
+                  {
+                      "type": "header",
+                      "text": {
+                          "type": "plain_text",
+                          "text": f"{org_name} GitHub AI usage report",
+                      },
+                  },
+                  {
+                      "type": "section",
+                      "text": {
+                          "type": "mrkdwn",
+                          "text": (
+                              f"{status_emoji} {status_text}\n\n"
+                              f"* *Included Credits:* {base_credits_used:,.0f} / {included_cap:,.0f} credits ({base_pct:.1f}%)\n"
+                              f"* *Additional Budget:* ${used_additional_dollars:,.2f} / ${budget_cap:,.2f} ({additional_pct:.1f}%)"
+                          ),
+                      },
+                  },
+                  {
+                      "type": "context",
+                      "elements": [
+                          {"type": "mrkdwn", "text": "Automated daily report generated via GitHub Actions."}
+                      ],
+                  },
+              ]
+          }
+
+          res = requests.post(webhook_url, json=slack_payload, timeout=10)
+          res.raise_for_status()
+          print("Successfully posted report to Slack!")
+          print(f"Included Credits:  {base_credits_used:,.0f} / {included_cap:,.0f} credits ({base_pct:.1f}%)")
+          print(f"Additional Budget: ${used_additional_dollars:,.2f} / ${budget_cap:,.2f} ({additional_pct:.1f}%)")
+          EOF
+
+      # 5. If steps 2-4 failed on a real (non-PR) run, alert Slack instead
+      #    of failing silently. PR runs surface failures via the check
+      #    itself, so no alert needed there.
+      - name: Alert Slack on failure
+        if: failure() && github.event_name != 'pull_request'
+        run: |
+          curl -sS -X POST -H 'Content-Type: application/json' \
+            -d "{\"text\": \":red_circle: AI Usage Report workflow failed for \`${ORG_NAME}\` - see ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\"}" \
+            "$SLACK_WEBHOOK_URL"
