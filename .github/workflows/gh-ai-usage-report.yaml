@@ -4,12 +4,19 @@ name: AI Usage Report
 # with proper read privileges) to get the current status of our ai credits
 # usage. Then, it crafts and posts a message on the general-e3sm slack
 # channel on e3sm-project.slack.com
+#
+# It also runs (fetch + validate steps only, no Slack post) on any PR that
+# touches this file, as a check that the REST calls still succeed and that
+# the numbers they produce still parse as numbers.
 
 on:
   schedule:
     # Runs daily at 08:00 AM UTC
     - cron: '0 8 * * *'
   workflow_dispatch: # Allows running manually from GitHub UI
+  pull_request:
+    paths:
+      - '.github/workflows/gh-ai-usage-report.yaml'
 
 permissions:
   contents: read
@@ -17,6 +24,12 @@ permissions:
 jobs:
   report-usage:
     runs-on: ubuntu-latest
+    env:
+      ORG_NAME: ${{ github.repository_owner }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      # Configured based on the org's "Copilot" settings in the GitHub UI
+      INCLUDED_CREDITS_CAP: "85500"
+      ADDITIONAL_BUDGET_CAP: "1500.00"
     steps:
       # 1. Mint short-lived installation token from your GitHub App
       - name: Generate GitHub App Token
@@ -37,15 +50,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      # 2. Query GitHub Billing API and Post Report to Slack
-      - name: Fetch Metrics and Post to Slack
+      # 2. Query the GitHub Billing API only. Sets used_credits /
+      #    used_additional_dollars as step outputs, doesn't touch Slack.
+      - name: Fetch usage from GitHub Billing API
+        id: fetch-usage
         env:
           GH_TOKEN: ${{ steps.generate-token.outputs.token }}
-          ORG_NAME: ${{ github.repository_owner }}
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          # Configured based on the org's "Copilot" settings in the GitHub UI
-          INCLUDED_CREDITS_CAP: "85500"
-          ADDITIONAL_BUDGET_CAP: "1500.00"
         run: |
           python3 - << 'EOF'
           import os
@@ -56,9 +66,6 @@ jobs:
 
           gh_token = os.environ["GH_TOKEN"]
           org_name = os.environ["ORG_NAME"]
-          webhook_url = os.environ["SLACK_WEBHOOK_URL"]
-          included_cap = float(os.environ.get("INCLUDED_CREDITS_CAP", "85500"))
-          budget_cap = float(os.environ.get("ADDITIONAL_BUDGET_CAP", "1500.00"))
 
           headers = {
               "Authorization": f"Bearer {gh_token}",
@@ -66,9 +73,7 @@ jobs:
               "X-GitHub-Api-Version": "2022-11-28",
           }
 
-          def post_slack(payload):
-              res = requests.post(webhook_url, json=payload, timeout=10)
-              res.raise_for_status()
+          current_month_prefix = datetime.now(timezone.utc).strftime("%Y-%m")
 
           # Fetch all pages of the org's billing usage report
           usage_items = []
@@ -80,19 +85,15 @@ jobs:
                   usage_items.extend(response.json().get("usageItems", []))
                   url = response.links.get("next", {}).get("url")
           except requests.RequestException as exc:
-              post_slack({"text": f":red_circle: Daily AI usage report failed to fetch billing data for `{org_name}`: {exc}"})
+              print(f"::error::Failed to fetch billing usage for `{org_name}`: {exc}")
               sys.exit(1)
 
           if not usage_items:
-              post_slack({
-                  "text": (
-                      f":warning: Daily AI usage report for `{org_name}` got an empty usage response. "
-                      "Check the GitHub App's Administration (read) permission and installation scope."
-                  )
-              })
+              print(
+                  f"::error::Billing usage API returned no usageItems for `{org_name}`. "
+                  "Check the GitHub App's Administration (read) permission and installation scope."
+              )
               sys.exit(1)
-
-          current_month_prefix = datetime.now(timezone.utc).strftime("%Y-%m")
 
           used_credits = 0.0
           used_additional_dollars = 0.0
@@ -102,6 +103,70 @@ jobs:
               if item_date.startswith(current_month_prefix) and product == "copilot":
                   used_credits += item.get("quantity", 0.0)
                   used_additional_dollars += item.get("netAmount", 0.0)
+
+          print(f"Raw totals: used_credits={used_credits}, used_additional_dollars={used_additional_dollars}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"used_credits={used_credits}\n")
+              f.write(f"used_additional_dollars={used_additional_dollars}\n")
+          EOF
+
+      # 3. Sanity-check that the values crossing the step boundary are
+      #    actually numbers (GitHub Actions step outputs are always plain
+      #    strings, so a REST field rename or type change upstream would
+      #    otherwise only show up as a garbled Slack message). Runs on
+      #    every trigger, including PRs.
+      - name: Validate usage numbers
+        id: validate-usage
+        env:
+          USED_CREDITS: ${{ steps.fetch-usage.outputs.used_credits }}
+          USED_ADDITIONAL_DOLLARS: ${{ steps.fetch-usage.outputs.used_additional_dollars }}
+        run: |
+          python3 - << 'EOF'
+          import math
+          import os
+          import sys
+
+          def validate(name, raw_value):
+              try:
+                  value = float(raw_value)
+              except (TypeError, ValueError):
+                  print(f"::error::{name} is not a valid number: {raw_value!r}")
+                  sys.exit(1)
+              if math.isnan(value) or math.isinf(value):
+                  print(f"::error::{name} is not a finite number: {raw_value!r}")
+                  sys.exit(1)
+              if value < 0:
+                  print(f"::error::{name} is negative, which should not happen: {value}")
+                  sys.exit(1)
+              return value
+
+          used_credits = validate("used_credits", os.environ["USED_CREDITS"])
+          used_additional_dollars = validate("used_additional_dollars", os.environ["USED_ADDITIONAL_DOLLARS"])
+
+          print(f"OK: used_credits={used_credits}, used_additional_dollars={used_additional_dollars}")
+          EOF
+
+      # 4. Craft the Slack Block Kit message and post it. Skipped on PR
+      #    runs - those only need steps 2-3 to pass as a check.
+      - name: Craft and post Slack message
+        if: github.event_name != 'pull_request'
+        env:
+          USED_CREDITS: ${{ steps.fetch-usage.outputs.used_credits }}
+          USED_ADDITIONAL_DOLLARS: ${{ steps.fetch-usage.outputs.used_additional_dollars }}
+        run: |
+          python3 - << 'EOF'
+          import os
+          from datetime import datetime, timezone
+
+          import requests
+
+          org_name = os.environ["ORG_NAME"]
+          webhook_url = os.environ["SLACK_WEBHOOK_URL"]
+          included_cap = float(os.environ.get("INCLUDED_CREDITS_CAP", "85500"))
+          budget_cap = float(os.environ.get("ADDITIONAL_BUDGET_CAP", "1500.00"))
+          used_credits = float(os.environ["USED_CREDITS"])
+          used_additional_dollars = float(os.environ["USED_ADDITIONAL_DOLLARS"])
 
           base_credits_used = min(used_credits, included_cap)
           base_pct = (base_credits_used / included_cap) * 100.0 if included_cap > 0 else 0.0
@@ -146,8 +211,19 @@ jobs:
               ]
           }
 
-          post_slack(slack_payload)
+          res = requests.post(webhook_url, json=slack_payload, timeout=10)
+          res.raise_for_status()
           print("Successfully posted report to Slack!")
           print(f"Included Credits:  {base_credits_used:,.0f} / {included_cap:,.0f} credits ({base_pct:.1f}%)")
           print(f"Additional Budget: ${used_additional_dollars:,.2f} / ${budget_cap:,.2f} ({additional_pct:.1f}%)")
           EOF
+
+      # 5. If steps 2-4 failed on a real (non-PR) run, alert Slack instead
+      #    of failing silently. PR runs surface failures via the check
+      #    itself, so no alert needed there.
+      - name: Alert Slack on failure
+        if: failure() && github.event_name != 'pull_request'
+        run: |
+          curl -sS -X POST -H 'Content-Type: application/json' \
+            -d "{\"text\": \":red_circle: AI Usage Report workflow failed for \`${ORG_NAME}\` - see ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\"}" \
+            "$SLACK_WEBHOOK_URL"
