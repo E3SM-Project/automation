@@ -243,10 +243,12 @@ jobs:
           print(f"OK: {values}")
           EOF
 
-      # 4. Craft the Slack Block Kit message and post it. Skipped on PR
-      #    runs - those only need steps 2-3 to pass as a check.
+      # 4. Craft the Slack Block Kit message. On a real (non-PR) trigger,
+      #    post it to Slack as usual. On a pull_request run, don't touch
+      #    Slack at all - print the message and write it to the job's Step
+      #    Summary instead, so reviewers can see exactly what would be
+      #    posted without merging and without spamming the channel.
       - name: Craft and post Slack message
-        if: github.event_name != 'pull_request'
         env:
           INCLUDED_CREDITS_USED: ${{ steps.fetch-usage.outputs.included_credits_used }}
           INCLUDED_CREDITS_CAP: ${{ steps.fetch-usage.outputs.included_credits_cap }}
@@ -255,7 +257,6 @@ jobs:
         run: |
           python3 - << 'EOF'
           import os
-          from datetime import datetime, timezone
 
           import requests
 
@@ -272,13 +273,16 @@ jobs:
 
           if used_additional_dollars > budget_cap:
               status_emoji = ":red_circle:"
-              status_text = f"*Status:* BUDGET EXCEEDED (Over by ${used_additional_dollars - budget_cap:,.2f})"
+              status_label = f"BUDGET EXCEEDED (Over by ${used_additional_dollars - budget_cap:,.2f})"
           elif additional_pct >= 85.0:
               status_emoji = ":warning:"
-              status_text = "*Status:* Warning - Additional budget over 85% depleted"
+              status_label = "Warning - Additional budget over 85% depleted"
           else:
               status_emoji = ":large_green_circle:"
-              status_text = "*Status:* Normal"
+              status_label = "Normal"
+
+          included_line = f"Included Credits: {base_credits_used:,.0f} / {included_cap:,.0f} credits ({base_pct:.1f}%)"
+          additional_line = f"Additional Budget: ${used_additional_dollars:,.2f} / ${budget_cap:,.2f} ({additional_pct:.1f}%)"
 
           slack_payload = {
               "blocks": [
@@ -294,9 +298,9 @@ jobs:
                       "text": {
                           "type": "mrkdwn",
                           "text": (
-                              f"{status_emoji} {status_text}\n\n"
-                              f"* *Included Credits:* {base_credits_used:,.0f} / {included_cap:,.0f} credits ({base_pct:.1f}%)\n"
-                              f"* *Additional Budget:* ${used_additional_dollars:,.2f} / ${budget_cap:,.2f} ({additional_pct:.1f}%)"
+                              f"{status_emoji} *Status:* {status_label}\n\n"
+                              f"* *{included_line}*\n"
+                              f"* *{additional_line}*"
                           ),
                       },
                   },
@@ -309,11 +313,26 @@ jobs:
               ]
           }
 
-          res = requests.post(webhook_url, json=slack_payload, timeout=10)
-          res.raise_for_status()
-          print("Successfully posted report to Slack!")
-          print(f"Included Credits:  {base_credits_used:,.0f} / {included_cap:,.0f} credits ({base_pct:.1f}%)")
-          print(f"Additional Budget: ${used_additional_dollars:,.2f} / ${budget_cap:,.2f} ({additional_pct:.1f}%)")
+          if os.environ.get("GITHUB_EVENT_NAME") == "pull_request":
+              print("pull_request run - not posting to Slack. Message that would be posted:\n")
+              print(f"{org_name} GitHub AI usage report")
+              print(f"{status_emoji} Status: {status_label}\n")
+              print(included_line)
+              print(additional_line)
+
+              summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary_path:
+                  with open(summary_path, "a") as f:
+                      f.write(f"## {org_name} GitHub AI usage report (PR preview - not posted to Slack)\n\n")
+                      f.write(f"{status_emoji} **Status:** {status_label}\n\n")
+                      f.write(f"- **{included_line}**\n")
+                      f.write(f"- **{additional_line}**\n")
+          else:
+              res = requests.post(webhook_url, json=slack_payload, timeout=10)
+              res.raise_for_status()
+              print("Successfully posted report to Slack!")
+              print(included_line)
+              print(additional_line)
           EOF
 
       # 5. If steps 2-4 failed on a real (non-PR) run, alert Slack instead
