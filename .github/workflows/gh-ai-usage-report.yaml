@@ -24,7 +24,7 @@ jobs:
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
 
-      # 2. Query GitHub API and Post Report to Slack
+      # 2. Query GitHub Billing API and Post Report to Slack
       - name: Fetch Metrics and Post to Slack
         uses: actions/github-script@v7
         env:
@@ -38,27 +38,48 @@ jobs:
 
             let usageDetails = "";
 
+            // Helper to format currency
+            const formatUSD = (val) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(val || 0);
+
             try {
-              // Endpoint for Copilot billing / seat breakdown
-              const response = await github.request('GET /orgs/{org}/copilot/billing', {
+              // Attempt 1: Fetch Enterprise / Org Budget status
+              const response = await github.request('GET /orgs/{org}/settings/billing/summary', {
                 org: org,
-                headers: {
-                  'X-GitHub-Api-Version': '2022-11-28'
-                }
+                headers: { 'X-GitHub-Api-Version': '2022-11-28' }
               });
 
-              const seats = response.data.seat_breakdown;
-              usageDetails = "- Total Assigned Seats: " + seats.total + "\n" +
-                             "- Active Seats (This Cycle): " + seats.active_this_cycle + "\n" +
-                             "- Inactive Seats: " + seats.inactive_this_cycle;
+              const data = response.data;
+              const used = formatUSD(data.total_amount_spent);
+              const budget = data.budget_limit ? formatUSD(data.budget_limit) : "Unlimited";
+              
+              let pctStr = "";
+              if (data.budget_limit && data.budget_limit > 0) {
+                pctStr = " (" + ((data.total_amount_spent / data.budget_limit) * 100).toFixed(1) + "% used)";
+              }
+
+              usageDetails = "AI Credit Usage: " + used + " / " + budget + pctStr;
+
             } catch (err) {
-              console.log("Could not fetch Copilot billing:", err.message);
-              usageDetails = "Notice: Unable to parse seat breakdown. Verify App permissions for Organization Billing. Error: " + err.message;
+              console.log("Org-level billing API error:", err.message);
+
+              // Attempt 2: Fallback for Enterprise Billing API endpoint
+              try {
+                const entResp = await github.request('GET /enterprises/{enterprise}/settings/billing/summary', {
+                  enterprise: org,
+                  headers: { 'X-GitHub-Api-Version': '2022-11-28' }
+                });
+
+                const data = entResp.data;
+                usageDetails = "Enterprise Billing Usage: " + formatUSD(data.total_gross_amount) + " / " + formatUSD(data.budget_limit);
+              } catch (entErr) {
+                console.log("Enterprise-level billing API error:", entErr.message);
+                usageDetails = "Notice: Unable to access billing API directly. Ensure the GitHub App has 'Enterprise Billing: Read-Only' permissions.";
+              }
             }
 
-            // Construct formatted Slack message payload using standard plain text block
+            // Construct formatted Slack message
             const slackPayload = {
-              text: "Daily AI Usage Report for " + org + ":\n\n" + usageDetails
+              text: "Daily Usage Report for " + org + ":\n\n" + usageDetails
             };
 
             // Post to Slack Webhook
