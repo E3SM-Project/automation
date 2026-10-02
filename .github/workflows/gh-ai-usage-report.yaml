@@ -161,22 +161,25 @@ jobs:
           # 3. Additional budget cap: read the org-level "copilot"
           # ProductPricing budget - the "Edit budget" cap set in the
           # GitHub UI - instead of hardcoding it.
+          # 3. Additional budget cap: read the org-level AI budget cap set in the GitHub UI
+
           budgets = get_paginated(
-              f"https://api.github.com/orgs/{org_name}/settings/billing/budgets", "budgets"
+            f"https://api.github.com/orgs/{org_name}/settings/billing/budgets", "budgets"
           )
+
           additional_budget_cap = next(
               (
                   b.get("budget_amount")
                   for b in budgets
-                  if b.get("budget_type") == "ProductPricing"
-                  and b.get("budget_product_sku") == "copilot"
-                  and b.get("budget_scope") == "organization"
+                  if b.get("budget_scope") == "organization"
+                  and b.get("budget_product_sku") in ("ai_credits", "copilot")
+                  
               ),
               None,
           )
           if additional_budget_cap is None:
               print(
-                  f"::error::No org-level ProductPricing/copilot budget found for `{org_name}` - "
+                  f"::error::No org-level AI budget found for `{org_name}` - "
                   "was it renamed or removed in the GitHub UI?"
               )
               sys.exit(1)
