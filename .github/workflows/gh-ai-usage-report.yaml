@@ -89,22 +89,12 @@ jobs:
           # the included AI-credit pool, netAmount is what was actually
           # billed as overage.
           #
-          # These two sums track different things and are NOT computed the
-          # same way:
-          # - included_dollars_used (-> "Included Credits") excludes
-          #   "UserMonths"-billed items, since those are flat per-seat
-          #   subscription fees, not AI credit consumption. Verified to
-          #   match the "AI usage" billing page's "Included credits" figure
-          #   exactly.
-          # - used_additional_dollars (-> "Additional Budget") deliberately
-          #   INCLUDES UserMonths items. The org's $-denominated budget cap
-          #   (see step 3) is an org-wide "copilot" ProductPricing budget,
-          #   and GitHub's own "Budgets and alerts" page tracks spend
-          #   against it as total copilot product spend - seat subscription
-          #   fees included - not just AI-credit overage. Excluding seat
-          #   fees here would under-report spend against that cap and could
-          #   show "under budget" while GitHub's own enforcement considers
-          #   the org already over it.
+          # Both sums exclude "UserMonths"-billed items, since those are flat
+          # per-seat subscription fees, not AI credit consumption. The org's
+          # budget (see step 3) is now an "All AI Credit SKUs" budget, which
+          # only tracks AI-credit spend, so seat fees must not count
+          # against it (including them reported e.g. $51.48 spent while the
+          # GitHub budget page showed $0).
           usage_items = get_paginated(
               f"https://api.github.com/orgs/{org_name}/settings/billing/usage", "usageItems"
           )
@@ -122,9 +112,14 @@ jobs:
                   continue
               if not item.get("date", "").startswith(current_month_prefix):
                   continue
-              used_additional_dollars += item.get("netAmount", 0.0)
+              print(
+                  f"item: sku={item.get('sku')!r} unitType={item.get('unitType')!r} "
+                  f"gross={item.get('grossAmount')} discount={item.get('discountAmount')} "
+                  f"net={item.get('netAmount')}"
+              )
               if item.get("unitType") == "UserMonths":
                   continue
+              used_additional_dollars += item.get("netAmount", 0.0)
               included_dollars_used += item.get("discountAmount", 0.0)
 
           included_credits_used = included_dollars_used * 100  # 1 AI credit = $0.01
