@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       ORG_NAME: ${{ github.repository_owner }}
-      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_E3SM_AI_HELP_WEBHOOK_URL }}
     steps:
       # 1. Mint short-lived installation token from your GitHub App
       - name: Generate GitHub App Token
