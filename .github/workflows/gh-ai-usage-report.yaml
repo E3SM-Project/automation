@@ -162,8 +162,12 @@ jobs:
           # ProductPricing budget - the "Edit budget" cap set in the
           # GitHub UI - instead of hardcoding it.
           budgets = get_paginated(
-              f"https://api.github.com/orgs/{org_name}/settings/billing/budgets", "budgets"
+            f"https://api.github.com/orgs/{org_name}/settings/billing/budgets", "budgets"
           )
+
+          print(f"::notice::RAW BUDGETS RETURNED FOR {org_name}:")
+          for b in budgets:
+              print(f"::notice:: {b}")
           additional_budget_cap = next(
               (
                   b.get("budget_amount")
