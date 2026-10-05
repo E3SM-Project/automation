@@ -254,7 +254,9 @@ jobs:
           ADDITIONAL_BUDGET_CAP: ${{ steps.fetch-usage.outputs.additional_budget_cap }}
         run: |
           python3 - << 'EOF'
+          import calendar
           import os
+          from datetime import datetime, timezone
 
           import requests
 
@@ -269,6 +271,24 @@ jobs:
           base_pct = (base_credits_used / included_cap) * 100.0 if included_cap > 0 else 0.0
           additional_pct = (used_additional_dollars / budget_cap) * 100.0 if budget_cap > 0 else 0.0
 
+          # Month-to-date pace. License credits burn first and additional
+          # credits second, so the two pools are best viewed as one combined
+          # allotment (1 AI credit = $0.01) compared against the share of the
+          # month that has elapsed (linear trajectory).
+          now = datetime.now(timezone.utc)
+          days_in_month = calendar.monthrange(now.year, now.month)[1]
+          elapsed_pct = now.day / days_in_month * 100.0
+          total_allotment = included_cap + budget_cap * 100
+          total_used = base_credits_used + used_additional_dollars * 100
+          total_pct = total_used / total_allotment * 100.0
+          pace_delta = total_pct - elapsed_pct
+          if abs(pace_delta) < 2.0:
+              pace_verdict = "on pace"
+          elif pace_delta > 0:
+              pace_verdict = f"{pace_delta:.1f} pts AHEAD of pace"
+          else:
+              pace_verdict = f"{-pace_delta:.1f} pts behind pace"
+
           if used_additional_dollars > budget_cap:
               status_emoji = ":red_circle:"
               status_label = f"BUDGET EXCEEDED (Over by ${used_additional_dollars - budget_cap:,.2f})"
@@ -281,6 +301,12 @@ jobs:
 
           included_line = f"Included Credits: {base_credits_used:,.0f} / {included_cap:,.0f} credits ({base_pct:.1f}%)"
           additional_line = f"Additional Budget: ${used_additional_dollars:,.2f} / ${budget_cap:,.2f} ({additional_pct:.1f}%)"
+
+          pace_line = (
+              f"Overall: {total_pct:.1f}% used vs {elapsed_pct:.1f}% of month "
+              f"(day {now.day}/{days_in_month}) - {pace_verdict} "
+              f"(${total_used / 100:,.0f} used vs ${total_allotment * elapsed_pct / 100 / 100:,.0f} expected)"
+          )
 
           slack_payload = {
               "blocks": [
@@ -298,7 +324,8 @@ jobs:
                           "text": (
                               f"{status_emoji} *Status:* {status_label}\n\n"
                               f"* *{included_line}*\n"
-                              f"* *{additional_line}*"
+                              f"* *{additional_line}*\n"
+                              f"* *{pace_line}*"
                           ),
                       },
                   },
@@ -317,6 +344,7 @@ jobs:
               print(f"{status_emoji} Status: {status_label}\n")
               print(included_line)
               print(additional_line)
+              print(pace_line)
 
               summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
               if summary_path:
@@ -325,12 +353,14 @@ jobs:
                       f.write(f"{status_emoji} **Status:** {status_label}\n\n")
                       f.write(f"- **{included_line}**\n")
                       f.write(f"- **{additional_line}**\n")
+                      f.write(f"- **{pace_line}**\n")
           else:
               res = requests.post(webhook_url, json=slack_payload, timeout=10)
               res.raise_for_status()
               print("Successfully posted report to Slack!")
               print(included_line)
               print(additional_line)
+              print(pace_line)
           EOF
 
       # 5. If steps 2-4 failed on a real (non-PR) run, alert Slack instead
