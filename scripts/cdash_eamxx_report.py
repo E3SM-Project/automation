@@ -48,6 +48,7 @@ Slack settings (environment variables):
 """
 
 import argparse
+from datetime import datetime, timezone
 import gzip
 import json
 import os
@@ -78,6 +79,8 @@ GROUPS = {
     "E3SM_MustPass": "eamxx",
 }
 NAME_FILTER = "eamxx"
+MAX_SUITE_AGE_HOURS = 18
+MAX_SUITE_AGE_SECONDS = MAX_SUITE_AGE_HOURS * 60 * 60
 
 BLESS_RE = re.compile(r"Most recent bless:\s*sha:(\S+)\s+date:(\S+)")
 PHASE_RE = re.compile(r"(\w+) FAILED for test")
@@ -163,22 +166,32 @@ def classify(t, build_error_text):
 
 
 # --------------------------------------------------------------------------- collect
-def collect(date):
+def collect(date, now=None):
     url = f"{CDASH}/api/v1/index.php?project={PROJECT}" + (f"&date={date}" if date else "")
     index = http_json(url)
     report = {"date": index.get("date"), "groups": [],
               "coverage": collect_coverage(index)}
+    cutoff = (time.time() if now is None else now) - MAX_SUITE_AGE_SECONDS
     by_name = {g["name"]: g for g in index.get("buildgroups", [])}
 
     for gname, mode in GROUPS.items():
         g = by_name.get(gname)
-        group = {"name": gname, "mode": mode, "builds": [], "missing": g is None}
+        group = {"name": gname, "mode": mode, "builds": [], "missing": g is None,
+                 "excluded_old": 0}
         for b in (g or {}).get("builds", []):
             tests = paged(TESTS_Q, b["id"], "tests")
             if mode == NAME_FILTER:
                 tests = [t for t in tests if NAME_FILTER in t["name"].lower()]
                 if not tests:
                     continue
+
+            try:
+                started_at = float(b.get("builddatefull"))
+            except (TypeError, ValueError):
+                started_at = None  # keep suites CDash did not timestamp
+            if started_at is not None and started_at < cutoff:
+                group["excluded_old"] += 1
+                continue
 
             # Build errors: CDash puts the failing test's name in stdError/stdOutput.
             build_errors = []
@@ -228,6 +241,7 @@ def collect(date):
             group["builds"].append({
                 "id": b["id"], "site": b["site"], "name": b["buildname"], "tests": tests,
                 "counts": counts, "orphan_build_errors": orphan,
+                "started_at": started_at,
                 # Only suites that appear in the details section need their commit.
                 "commit": find_commit(b["id"], tests) if has_problems else None,
             })
@@ -796,6 +810,13 @@ def has_problems(b):
     return bool(c["FAIL"] or c["BUILDFAIL"] or c["DIFF"] or b["orphan_build_errors"])
 
 
+def suite_started_at(b):
+    """Format a CDash build-start epoch unambiguously for the Markdown report."""
+    if b.get("started_at") is None:
+        return None
+    return datetime.fromtimestamp(b["started_at"], timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
 def format_header(rep, slack=False):
     total, nsuites = report_totals(rep)
     return [f"*E3SM CDash EAMxx report: testing day {display(rep['date'], slack)}*",
@@ -803,22 +824,32 @@ def format_header(rep, slack=False):
             f"{nsuites} suites · {sum(total.values()):,} tests · {counts_str(total)}"]
 
 
-def format_suites(rep, slack=False):
-    """Every suite in every category with its counts."""
+def format_group_summary(rep, slack=False):
+    """One aggregate line per test group, without listing individual suites."""
     lines = []
     for g in rep["groups"]:
-        scope = "all tests" if g["mode"] == "all" else f"tests containing `{NAME_FILTER}`"
-        lines.append(f"*{display(g['name'], slack)}* ({scope})")
         if g["missing"]:
-            lines.append("    _group not present on the dashboard today_")
-        elif not g["builds"]:
-            lines.append("    _no matching tests today_")
-        for b in g["builds"]:
-            extra = (f" · {EMOJI['BUILDFAIL']} {b['orphan_build_errors']} build errors not tied to a test"
-                     if b["orphan_build_errors"] else "")
-            lines.append(f"    • {blink(b, slack)}: {counts_str(b['counts'])}{extra}")
-        lines.append("")
+            lines.append(f"• *{display(g['name'], slack)}*: _group not present on the dashboard today_")
+            continue
+        counts = sum((b["counts"] for b in g["builds"]), Counter())
+        nbuilds = len(g["builds"])
+        problems = sum(has_problems(b) for b in g["builds"])
+        line = (f"• *{display(g['name'], slack)}* ({nbuilds} suite{'s' if nbuilds != 1 else ''}): "
+                f"{counts_str(counts)}")
+        if problems:
+            line += f" · _{problems} suite{'s' if problems != 1 else ''} need{'s' if problems == 1 else ''} attention_"
+        lines.append(line)
     return lines
+
+
+def format_excluded_old(rep):
+    """Briefly report suites skipped because their CDash build start is stale."""
+    total = sum(g["excluded_old"] for g in rep["groups"])
+    by_group = " · ".join(f"{g['name']}: {g['excluded_old']}" for g in rep["groups"]
+                          if g["excluded_old"])
+    detail = by_group or "none"
+    return (f"*Suites excluded as older than {MAX_SUITE_AGE_HOURS} hours:* "
+            f"{total} ({detail})")
 
 
 def format_details(rep, evidence_note=None, slack=False):
@@ -830,6 +861,8 @@ def format_details(rep, evidence_note=None, slack=False):
     for g, b in problems:
         lines.append("")
         lines.append(f"*{display(g['name'], slack)}* · {blink(b, slack)}")
+        if not slack and (started_at := suite_started_at(b)):
+            lines.append(f"  Started: {started_at}")
         if b.get("commit"):
             sha, source = b["commit"]
             lines.append(f"  Commit tested: <{GITHUB_REPO}/commit/{sha}|`{sha[:12]}`>"
@@ -869,25 +902,44 @@ def format_details(rep, evidence_note=None, slack=False):
 
 
 def format_report(rep, slack=False):
-    """The full report: summary, every suite, coverage, details."""
-    return "\n".join(format_header(rep, slack) + [""] + format_suites(rep, slack)
-                     + format_coverage(rep["coverage"], slack) + [""]
+    """Compact report: aggregate status, stale count, coverage, and problems."""
+    return "\n".join(format_header(rep, slack) + [""] + format_group_summary(rep, slack)
+                     + [format_excluded_old(rep), ""] + format_coverage(rep["coverage"], slack) + [""]
                      + format_details(rep, slack=slack))
+
+
+def format_markdown_report(rep):
+    """Markdown report with a table for aligned per-group test-status counts."""
+    total, nsuites = report_totals(rep)
+    lines = [
+        f"## E3SM CDash EAMxx report: testing day {rep['date']}",
+        f"[Dashboard]({CDASH}/index.php?project={PROJECT}&date={rep['date']}) · "
+        f"{nsuites} suites · {sum(total.values()):,} tests",
+        "",
+        "| Group | Suites | PASS | FAIL | BUILD FAIL | DIFF | Not run |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for g in rep["groups"]:
+        if g["missing"]:
+            lines.append(f"| {g['name']} | — | — | — | — | — | — |")
+            continue
+        counts = sum((b["counts"] for b in g["builds"]), Counter())
+        lines.append(f"| {g['name']} | {len(g['builds'])} | {counts['PASS']:,} | "
+                     f"{counts['FAIL']:,} | {counts['BUILDFAIL']:,} | {counts['DIFF']:,} | "
+                     f"{counts['NOTRUN']:,} |")
+    lines.append(f"| **Total** | **{nsuites}** | **{total['PASS']:,}** | **{total['FAIL']:,}** | "
+                 f"**{total['BUILDFAIL']:,}** | **{total['DIFF']:,}** | **{total['NOTRUN']:,}** |")
+    lines += ["", format_excluded_old(rep), ""]
+    lines += to_markdown("\n".join(format_coverage(rep["coverage"], slack=False)), title=False).splitlines()
+    lines += [""] + to_markdown("\n".join(format_details(rep)), title=False).splitlines()
+    return "\n".join(lines) + "\n"
 
 
 def format_slack_summary(rep, details_where):
     """A few lines for the channel: totals per category, coverage, and where the
     details are. details_where is a short mrkdwn phrase, or None."""
-    lines = format_header(rep, slack=True)
-    for g in rep["groups"]:
-        if g["missing"] or not g["builds"]:
-            continue
-        c = sum((b["counts"] for b in g["builds"]), Counter())
-        bad = sum(has_problems(b) for b in g["builds"])
-        n = len(g["builds"])
-        lines.append(f"• *{slack_escape(g['name'])}* ({n} suite{'s' if n != 1 else ''}): {counts_str(c)}"
-                     + (f" · _{bad} suite{'s' if bad != 1 else ''} need{'s' if bad == 1 else ''} attention_"
-                        if bad else ""))
+    lines = format_header(rep, slack=True) + format_group_summary(rep, slack=True)
+    lines.append(format_excluded_old(rep))
     if rep["coverage"]:
         lines.append("• *Coverage:* " + " · ".join(
             f"{slack_escape(c['site'])} {c['emoji']} {c['percentage']:.1f}%" for c in rep["coverage"]))
@@ -897,11 +949,10 @@ def format_slack_summary(rep, details_where):
 
 
 def format_thread(rep, with_file):
-    """What goes in the thread under the summary: every suite, then the details."""
+    """What goes in the thread under the summary: only problem details."""
     note = ("_Log excerpts behind each likely cause are in the report file below._" if with_file
             else None)
-    return "\n".join(format_suites(rep, slack=True) + format_coverage(rep["coverage"], slack=True) + [""]
-                     + format_details(rep, note, slack=True))
+    return "\n".join(format_details(rep, note, slack=True))
 
 
 
@@ -1102,7 +1153,7 @@ EMOJI_UNICODE = {
 }
 
 
-def to_markdown(text):
+def to_markdown(text, title=True):
     """Convert the Slack-formatted report to standard Markdown, readable as plain
     text too, and rendered nicely in the GitHub job summary."""
     out = []
@@ -1120,7 +1171,8 @@ def to_markdown(text):
         if indent:
             line = ("    - " if indent >= 10 else "  - " if indent > 4 else "- ") + body
         out.append(line)
-    out[0] = "## " + out[0].strip("*")  # report title
+    if title:
+        out[0] = "## " + out[0].strip("*")  # report title
     return "\n".join(out) + "\n"
 
 
@@ -1142,9 +1194,8 @@ def main():
     except (urllib.error.URLError, ssl.SSLError, TimeoutError, OSError) as e:
         print(f"\nError fetching CDash data: {e}", file=sys.stderr)
         return 1
-    text = format_report(rep)
     slack_text = format_report(rep, slack=True)
-    md = to_markdown(text) + format_evidence(rep)
+    md = format_markdown_report(rep) + format_evidence(rep)
 
     # 1. Always save a readable copy first, so a Slack problem can't lose the report.
     os.makedirs(args.output_dir, exist_ok=True)
