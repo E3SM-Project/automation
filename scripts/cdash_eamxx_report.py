@@ -18,16 +18,15 @@ Classification of each test:
   NOT RUN     status NOT_RUN (e.g. PEND); counted but not detailed
 
 Likely cause (FAIL and BUILD FAIL only): the suite's uploaded log tarball is
-read in memory (never extracted or executed) and matched against known failure
+streamed without extraction or execution and matched against known failure
 signatures: setup and module errors, full disks, compile errors, killed
 compilers, model aborts (using the message printed just before MPI_Abort),
 crashes, time limits, memory kills, comparison and memory-leak failures. The
 log lines behind each cause go in the saved report and GitHub job summary.
 
 Usage:
-  python cdash_eamxx_report.py                 # today's testing day
-  python cdash_eamxx_report.py --date 2026-10-28
-  python cdash_eamxx_report.py --dry-run       # print instead of posting
+  Run .github/workflows/cdash-eamxx-report.yaml on its weekday schedule, or
+  use workflow_dispatch to select a testing date or dry run.
 
 Output, in this order, so a Slack problem never loses the report:
   1. cdash_report/cdash_eamxx_report_<date>.md   readable Markdown copy (always)
@@ -50,7 +49,6 @@ Slack settings (environment variables):
 
 import argparse
 import gzip
-import io
 import json
 import os
 import re
@@ -62,7 +60,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections import Counter
+from collections import Counter, deque
 
 CDASH = "https://my.cdash.org"
 PROJECT = "E3SM"
@@ -126,9 +124,10 @@ TESTS_Q = """query($id: ID!, $after: String) {
     pageInfo { hasNextPage endCursor }
     edges { node { id name status details } } } } }"""
 
-# Logs are only pulled for non-passing tests we report on (FAILs and DIFFs).
-FAILED_LOGS_Q = """query($id: ID!, $after: String) {
-  build(id: $id) { tests(first: 50, after: $after, filters: {eq: {status: FAILED}}) {
+# Failed-test output is fetched only for tests included in the report.
+FAILED_LOGS_Q = """query($id: ID!, $after: String,
+                           $filters: BuildTestsFiltersMultiFilterInput!) {
+  build(id: $id) { tests(first: 50, after: $after, filters: $filters) {
     pageInfo { hasNextPage endCursor }
     edges { node { id output } } } } }"""
 
@@ -140,10 +139,11 @@ BUILD_ERRORS_Q = """query($id: ID!, $after: String) {
     edges { node { stdOutput stdError } } } } }"""
 
 
-def paged(query, build_id, field):
+def paged(query, build_id, field, variables=None):
     out, after = [], None
+    variables = variables or {}
     while True:
-        t = gql(query, {"id": str(build_id), "after": after})["build"][field]
+        t = gql(query, {"id": str(build_id), "after": after, **variables})["build"][field]
         out += [e["node"] for e in t["edges"]]
         if not t["pageInfo"]["hasNextPage"]:
             return out
@@ -189,7 +189,14 @@ def collect(date):
                                 for e in build_errors)
 
             if any(t["status"] == "FAILED" for t in tests):
-                logs = {n["id"]: n["output"] or "" for n in paged(FAILED_LOGS_Q, b["id"], "tests")}
+                failed_filters = {"eq": {"status": "FAILED"}}
+                if mode == NAME_FILTER:
+                    failed_filters = {"all": [
+                        failed_filters,
+                        {"contains": {"name": NAME_FILTER}},
+                    ]}
+                logs = {n["id"]: n["output"] or "" for n in paged(
+                    FAILED_LOGS_Q, b["id"], "tests", {"filters": failed_filters})}
                 for t in tests:
                     if t["status"] != "FAILED":
                         continue
@@ -262,8 +269,8 @@ def collect_coverage(index):
 
 # --------------------------------------------------------------------------- triage
 # "Likely cause" for FAIL and BUILD FAIL tests. Rule-based: it reads the test's
-# CDash output plus the suite's uploaded log tarball (read in memory; nothing is
-# extracted to disk or executed) and reports the first known failure signature,
+# CDash output plus the suite's uploaded log tarball (streamed without writing
+# to disk or executing it) and reports the first known failure signature,
 # with the log lines that support it. It is a starting point for a human, not a
 # verdict.
 
@@ -289,14 +296,23 @@ def read_capped(fileobj, gz):
     """Read a log, keeping its first LOG_HEAD and last LOG_TAIL bytes."""
     stream = gzip.GzipFile(fileobj=fileobj) if gz else fileobj
     head = stream.read(LOG_HEAD)
-    tail = b""
+    tail, tail_size = deque(), 0
     while True:
         chunk = stream.read(1024 * 1024)
         if not chunk:
             break
-        tail = (tail + chunk)[-LOG_TAIL:]
+        tail.append(chunk)
+        tail_size += len(chunk)
+        while tail_size > LOG_TAIL:
+            excess = tail_size - LOG_TAIL
+            first = tail.popleft()
+            if len(first) > excess:
+                tail.appendleft(first[excess:])
+                tail_size -= excess
+            else:
+                tail_size -= len(first)
     if tail:
-        head += b"\n[... middle of log skipped ...]\n" + tail
+        head += b"\n[... middle of log skipped ...]\n" + b"".join(tail)
     return head.decode("utf-8", errors="replace")
 
 
@@ -312,22 +328,21 @@ def build_logs(build_id, wanted_tests):
         req = urllib.request.Request(f"{CDASH}/builds/{build_id}/files/{f['id']}",
                                      headers={"User-Agent": "e3sm-cdash-eamxx-bot"})
         with urllib.request.urlopen(req, timeout=600) as r:
-            data = r.read()
-        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
-            for m in tar:
-                mt = TAR_TEST_RE.search("/" + m.name)
-                if not m.isfile() or not mt or mt.group(1) not in wanted_tests:
-                    continue
-                test, kind, rel = mt.groups()
-                base = rel.split("/")[-1]
-                if kind == "RUNDIR" and not re.match(r"(e3sm|atm|cpl)\.log\.", base):
-                    continue
-                if kind == "EXEROOT" and ".bldlog." not in base:
-                    continue
-                if kind == "CASEDIR" and base != "TestStatus.log":
-                    continue
-                text = read_capped(tar.extractfile(m), base.endswith(".gz"))
-                out.setdefault(test, {}).setdefault(kind, []).append((base, text))
+            with tarfile.open(fileobj=r, mode="r|gz") as tar:
+                for m in tar:
+                    mt = TAR_TEST_RE.search("/" + m.name)
+                    if not m.isfile() or not mt or mt.group(1) not in wanted_tests:
+                        continue
+                    test, kind, rel = mt.groups()
+                    base = rel.split("/")[-1]
+                    if kind == "RUNDIR" and not re.match(r"(e3sm|atm|cpl)\.log\.", base):
+                        continue
+                    if kind == "EXEROOT" and ".bldlog." not in base:
+                        continue
+                    if kind == "CASEDIR" and base != "TestStatus.log":
+                        continue
+                    text = read_capped(tar.extractfile(m), base.endswith(".gz"))
+                    out.setdefault(test, {}).setdefault(kind, []).append((base, text))
     def newest_first(ft):
         m = LID_RE.search(ft[0])
         return m.group(1) if m else ""
@@ -672,12 +687,22 @@ def triage_build_tests(build_id, tests):
 
 
 # --------------------------------------------------------------------------- format
-def blink(b):
-    return f"<{CDASH}/builds/{b['id']}|{b['site']} / {b['name']}>"
+def slack_escape(value):
+    """Escape text interpolated into Slack mrkdwn (but not Slack link syntax)."""
+    return str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def tlink(t):
-    return f"<{CDASH}/tests/{t['id']}|`{t['name']}`>"
+def display(value, slack):
+    return slack_escape(value) if slack else str(value)
+
+
+def blink(b, slack=False):
+    return (f"<{CDASH}/builds/{b['id']}|{display(b['site'], slack)} / "
+            f"{display(b['name'], slack)}>")
+
+
+def tlink(t, slack=False):
+    return f"<{CDASH}/tests/{t['id']}|`{display(t['name'], slack)}`>"
 
 
 def counts_str(c, show_zero=("PASS", "FAIL", "BUILDFAIL", "DIFF")):
@@ -685,19 +710,20 @@ def counts_str(c, show_zero=("PASS", "FAIL", "BUILDFAIL", "DIFF")):
     return " · ".join(parts)
 
 
-def format_failures(ts):
+def format_failures(ts, slack=False):
     """FAIL/BUILD FAIL tests with their likely cause, stated once when shared."""
     def test_line(t):
-        return f"      • {tlink(t)}" + (f" (failed at {t['phase']})" if t.get("phase") else "")
+        return (f"      • {tlink(t, slack)}" +
+                (f" (failed at {display(t['phase'], slack)})" if t.get("phase") else ""))
     causes = {t.get("likely_cause") for t in ts}
     if len(ts) > 1 and len(causes) == 1 and None not in causes:
-        return ([f"      _All {len(ts)} have the same likely cause:_ {causes.pop()}"]
+        return ([f"      _All {len(ts)} have the same likely cause:_ {display(causes.pop(), slack)}"]
                 + [test_line(t) for t in ts])
     out = []
     for t in ts:
         out.append(test_line(t))
         if t.get("likely_cause"):
-            out.append(f"          ↳ _Likely cause:_ {t['likely_cause']}")
+            out.append(f"          ↳ _Likely cause:_ {display(t['likely_cause'], slack)}")
     return out
 
 
@@ -740,7 +766,7 @@ def evidence_link():
     return "_Log excerpts behind each likely cause are in the saved report._"
 
 
-def format_coverage(cov):
+def format_coverage(cov, slack=False):
     lines = ["*Coverage* (unit tests)"]
     if not cov:
         return lines + ["    _no coverage results today_"]
@@ -750,7 +776,8 @@ def format_coverage(cov):
             d = c["percentagediff"]
             change = f" ({'+' if d >= 0 else ''}{d:.2f}% vs previous)"
         total = c["loctested"] + c["locuntested"]
-        lines.append(f"    • <{CDASH}/builds/{c['buildid']}/coverage|{c['site']} / {c['buildname']}>: "
+        lines.append(f"    • <{CDASH}/builds/{c['buildid']}/coverage|{display(c['site'], slack)} / "
+                     f"{display(c['buildname'], slack)}>: "
                      f"{c['emoji']} *{c['percentage']:.2f}%*{change} · "
                      f"{c['loctested']:,} of {total:,} lines covered")
     return lines
@@ -769,19 +796,19 @@ def has_problems(b):
     return bool(c["FAIL"] or c["BUILDFAIL"] or c["DIFF"] or b["orphan_build_errors"])
 
 
-def format_header(rep):
+def format_header(rep, slack=False):
     total, nsuites = report_totals(rep)
-    return [f"*E3SM CDash EAMxx report: testing day {rep['date']}*",
+    return [f"*E3SM CDash EAMxx report: testing day {display(rep['date'], slack)}*",
             f"<{CDASH}/index.php?project={PROJECT}&date={rep['date']}|Dashboard> · "
             f"{nsuites} suites · {sum(total.values()):,} tests · {counts_str(total)}"]
 
 
-def format_suites(rep):
+def format_suites(rep, slack=False):
     """Every suite in every category with its counts."""
     lines = []
     for g in rep["groups"]:
         scope = "all tests" if g["mode"] == "all" else f"tests containing `{NAME_FILTER}`"
-        lines.append(f"*{g['name']}* ({scope})")
+        lines.append(f"*{display(g['name'], slack)}* ({scope})")
         if g["missing"]:
             lines.append("    _group not present on the dashboard today_")
         elif not g["builds"]:
@@ -789,12 +816,12 @@ def format_suites(rep):
         for b in g["builds"]:
             extra = (f" · {EMOJI['BUILDFAIL']} {b['orphan_build_errors']} build errors not tied to a test"
                      if b["orphan_build_errors"] else "")
-            lines.append(f"    • {blink(b)}: {counts_str(b['counts'])}{extra}")
+            lines.append(f"    • {blink(b, slack)}: {counts_str(b['counts'])}{extra}")
         lines.append("")
     return lines
 
 
-def format_details(rep, evidence_note=None):
+def format_details(rep, evidence_note=None, slack=False):
     """FAILs, BUILD FAILs and DIFFs, suite by suite."""
     lines = []
     problems = [(g, b) for g in rep["groups"] for b in g["builds"] if has_problems(b)]
@@ -802,7 +829,7 @@ def format_details(rep, evidence_note=None):
                  else "*No FAILs, BUILD FAILs or DIFFs* :tada:")
     for g, b in problems:
         lines.append("")
-        lines.append(f"*{g['name']}* · {blink(b)}")
+        lines.append(f"*{display(g['name'], slack)}* · {blink(b, slack)}")
         if b.get("commit"):
             sha, source = b["commit"]
             lines.append(f"  Commit tested: <{GITHUB_REPO}/commit/{sha}|`{sha[:12]}`>"
@@ -813,7 +840,7 @@ def format_details(rep, evidence_note=None):
             ts = [t for t in b["tests"] if t["bucket"] == bucket]
             if ts:
                 lines.append(f"  {EMOJI[bucket]} *{LABEL[bucket]} ({len(ts)})*")
-                lines += format_failures(ts)
+                lines += format_failures(ts, slack)
         if b["orphan_build_errors"]:
             lines.append(f"  {EMOJI['BUILDFAIL']} *{b['orphan_build_errors']} build errors not tied to a test*: "
                          f"see <{CDASH}/builds/{b['id']}/build|build errors>")
@@ -824,44 +851,46 @@ def format_details(rep, evidence_note=None):
             if len(diffs) > 1 and len(blesses) == 1 and None not in blesses:
                 sha, date = blesses.pop()
                 lines.append(f"      _All DIFFs have the same sha and baseline date:_ "
-                             f"sha `{sha[:12]}` · blessed {date}")
-                lines += [f"      • {tlink(t)}" for t in diffs]
+                              f"sha `{sha[:12]}` · blessed {display(date, slack)}")
+                lines += [f"      • {tlink(t, slack)}" for t in diffs]
             else:
                 for t in diffs:
                     if t["bless"]:
-                        info = f"sha `{t['bless'][0][:12]}` · blessed {t['bless'][1]}"
+                        info = (f"sha `{t['bless'][0][:12]}` · blessed "
+                                f"{display(t['bless'][1], slack)}")
                     elif t.get("baseline_exception"):
                         info = "_baseline comparison raised an exception; no bless info in log_"
                     else:
                         info = "_bless info not found in log_"
-                    lines.append(f"      • {tlink(t)}: {info}")
+                    lines.append(f"      • {tlink(t, slack)}: {info}")
     if any(t.get("likely_cause") for g in rep["groups"] for b in g["builds"] for t in b["tests"]):
         lines += ["", evidence_note or evidence_link()]
     return lines
 
 
-def format_report(rep):
+def format_report(rep, slack=False):
     """The full report: summary, every suite, coverage, details."""
-    return "\n".join(format_header(rep) + [""] + format_suites(rep)
-                     + format_coverage(rep["coverage"]) + [""] + format_details(rep))
+    return "\n".join(format_header(rep, slack) + [""] + format_suites(rep, slack)
+                     + format_coverage(rep["coverage"], slack) + [""]
+                     + format_details(rep, slack=slack))
 
 
 def format_slack_summary(rep, details_where):
     """A few lines for the channel: totals per category, coverage, and where the
     details are. details_where is a short mrkdwn phrase, or None."""
-    lines = format_header(rep)
+    lines = format_header(rep, slack=True)
     for g in rep["groups"]:
         if g["missing"] or not g["builds"]:
             continue
         c = sum((b["counts"] for b in g["builds"]), Counter())
         bad = sum(has_problems(b) for b in g["builds"])
         n = len(g["builds"])
-        lines.append(f"• *{g['name']}* ({n} suite{'s' if n != 1 else ''}): {counts_str(c)}"
+        lines.append(f"• *{slack_escape(g['name'])}* ({n} suite{'s' if n != 1 else ''}): {counts_str(c)}"
                      + (f" · _{bad} suite{'s' if bad != 1 else ''} need{'s' if bad == 1 else ''} attention_"
                         if bad else ""))
     if rep["coverage"]:
         lines.append("• *Coverage:* " + " · ".join(
-            f"{c['site']} {c['emoji']} {c['percentage']:.1f}%" for c in rep["coverage"]))
+            f"{slack_escape(c['site'])} {c['emoji']} {c['percentage']:.1f}%" for c in rep["coverage"]))
     if details_where:
         lines.append(details_where)
     return "\n".join(lines)
@@ -871,8 +900,8 @@ def format_thread(rep, with_file):
     """What goes in the thread under the summary: every suite, then the details."""
     note = ("_Log excerpts behind each likely cause are in the report file below._" if with_file
             else None)
-    return "\n".join(format_suites(rep) + format_coverage(rep["coverage"]) + [""]
-                     + format_details(rep, note))
+    return "\n".join(format_suites(rep, slack=True) + format_coverage(rep["coverage"], slack=True) + [""]
+                     + format_details(rep, note, slack=True))
 
 
 
@@ -1096,57 +1125,11 @@ def to_markdown(text):
 
 
 
-def use_system_certificates():
-    """If the optional 'truststore' package is installed (pip install truststore,
-    Python 3.10+), verify HTTPS with the operating system's certificate store
-    instead of Python's own. This is what makes the script work behind firewalls
-    that inspect HTTPS, whose certificate IT has already installed on the machine."""
-    try:
-        import truststore
-        truststore.inject_into_ssl()
-        return True
-    except Exception:  # not installed, or Python too old: use Python's defaults
-        return False
-
-
-def make_console_safe():
-    """On Windows, output redirected to a file (or an old console) often uses a
-    legacy encoding that can't hold emoji. Swap unprintable characters for '?'
-    instead of crashing; the saved report file is always UTF-8 regardless."""
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(errors="replace")
-        except (AttributeError, ValueError):
-            pass
-
-
-def explain_network_error(e):
-    """Turn a failure to reach CDash into advice a desktop user can act on."""
-    reason = getattr(e, "reason", e)
-    if isinstance(reason, ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in str(e):
-        msg = ("Python could not verify my.cdash.org's security certificate.")
-        msg += ("\n  If your network or firewall inspects HTTPS traffic, run "
-                "'python3 -m pip install truststore' so Python uses your computer's "
-                "certificates, then try again.")
-        if sys.platform == "darwin":
-            msg += ("\n  Otherwise, on macOS with Python from python.org, run 'Install Certificates.command' "
-                    "in your Applications/Python 3.x folder, then try again.")
-        else:
-            msg += ("\n  Otherwise, ask IT for the firewall's CA certificate, or try off the VPN.")
-        return msg
-    if isinstance(e, urllib.error.HTTPError):
-        return f"my.cdash.org returned HTTP {e.code} ({e.reason}). The site may be down; try again later."
-    return (f"Could not reach my.cdash.org ({reason}).\n  Check your internet connection. "
-            "If you're behind a proxy, set the HTTPS_PROXY environment variable.")
-
-
 def main():
-    make_console_safe()
-    use_system_certificates()
     ap = argparse.ArgumentParser(
         description="Report EAMxx test results from the E3SM CDash dashboard. "
-                    "Run with no options to save and print today's report; it is only "
-                    "posted to Slack if SLACK_WEBHOOK_URL is set.")
+                    "Posts to Slack with SLACK_BOT_TOKEN plus SLACK_CHANNEL_ID, "
+                    "or falls back to SLACK_WEBHOOK_URL.")
     ap.add_argument("--date", help="CDash testing day YYYY-MM-DD (default: current)")
     ap.add_argument("--dry-run", action="store_true", help="don't post to Slack")
     ap.add_argument("--output-dir", default="cdash_report",
@@ -1157,9 +1140,10 @@ def main():
     try:
         rep = collect(args.date)
     except (urllib.error.URLError, ssl.SSLError, TimeoutError, OSError) as e:
-        print(f"\nError: {explain_network_error(e)}", file=sys.stderr)
+        print(f"\nError fetching CDash data: {e}", file=sys.stderr)
         return 1
     text = format_report(rep)
+    slack_text = format_report(rep, slack=True)
     md = to_markdown(text) + format_evidence(rep)
 
     # 1. Always save a readable copy first, so a Slack problem can't lose the report.
@@ -1168,7 +1152,7 @@ def main():
     with open(md_path, "w", encoding="utf-8") as f:
         f.write(md)
     with open(os.path.join(args.output_dir, "slack_message.txt"), "w", encoding="utf-8") as f:
-        f.write(text + "\n")  # exact Slack text, handy for pasting in by hand
+        f.write(slack_text + "\n")  # exact Slack text, handy for pasting in by hand
 
     # 2. Readable copy in the GitHub Actions job summary and the log.
     if os.environ.get("GITHUB_STEP_SUMMARY"):
@@ -1182,7 +1166,7 @@ def main():
         print("Dry run: not posting to Slack.", file=sys.stderr)
         return 0
     try:
-        posted = deliver_slack(rep, text, md_path)
+        posted = deliver_slack(rep, slack_text, md_path)
     except SlackPostError as e:
         msg = f"Slack post failed: {e}"
         print(f"::error title=Slack post failed::{e}" if os.environ.get("GITHUB_ACTIONS") else msg,
@@ -1201,8 +1185,6 @@ def main():
 
 
 if __name__ == "__main__":
-    if sys.version_info < (3, 8):
-        sys.exit("This script needs Python 3.8 or newer.")
     try:
         sys.exit(main())
     except KeyboardInterrupt:

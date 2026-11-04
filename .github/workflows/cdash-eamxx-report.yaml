@@ -2,12 +2,9 @@ name: CDash EAMxx daily report
 
 on:
   schedule:
-    # GitHub cron is UTC-only, so 8:00 AM Pacific is 15:00 UTC during daylight
-    # time (PDT) and 16:00 UTC during standard time (PST). Both are scheduled;
-    # the "Pacific time gate" step below lets only the one that lands at 8 AM
-    # Pacific actually run, so the report goes out once a day year-round.
-    - cron: "0 15 * * 1-5"
-    - cron: "0 16 * * 1-5"
+    # 18:00 UTC is 10 AM during daylight time (PDT) and 11 AM during standard
+    # time (PST), allowing most overnight CI results to reach CDash first.
+    - cron: "0 18 * * 1-5"
   workflow_dispatch:
     inputs:
       date:
@@ -26,32 +23,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - name: Pacific time gate
-        id: gate
-        run: |
-          # GitHub sometimes starts scheduled jobs late, so allow 8:00-9:59 and
-          # pick the run by its scheduled UTC hour.
-          sched_hour="${{ github.event.schedule }}"
-          if [ "${{ github.event_name }}" != "schedule" ]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          offset=$(TZ=America/Los_Angeles date +%z)   # -0700 (PDT) or -0800 (PST)
-          want="0 15 * * 1-5"; [ "$offset" = "-0800" ] && want="0 16 * * 1-5"
-          if [ "$sched_hour" = "$want" ]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "Skipping: this trigger isn't 8 AM Pacific today (offset $offset)."
-          fi
       - uses: actions/checkout@v4
-        if: steps.gate.outputs.run == 'true'
       - uses: actions/setup-python@v5
-        if: steps.gate.outputs.run == 'true'
         with:
           python-version: "3.12"
       - name: Build and post report
-        if: steps.gate.outputs.run == 'true'
         env:
+          INPUT_DATE: ${{ inputs.date }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
           # Preferred: a Slack app's bot token (summary in the channel, details
           # and the report file in a thread). Needs chat:write and files:write.
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
@@ -61,13 +40,13 @@ jobs:
           # Fallback when there's no bot token: summary plus a link to this run.
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_EAMXX_CDASH_WEBHOOK_URL }}
         run: |
-          args=""
-          [ -n "${{ inputs.date }}" ] && args="$args --date ${{ inputs.date }}"
-          [ "${{ inputs.dry_run }}" = "true" ] && args="$args --dry-run"
-          python cdash_eamxx_report.py $args
+          args=()
+          [ -n "$INPUT_DATE" ] && args+=(--date "$INPUT_DATE")
+          [ "$INPUT_DRY_RUN" = "true" ] && args+=(--dry-run)
+          python scripts/cdash_eamxx_report.py "${args[@]}"
       - name: Save report as artifact
         # Runs even if the Slack post failed, so the report is never lost.
-        if: always() && steps.gate.outputs.run == 'true'
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: cdash-eamxx-report
