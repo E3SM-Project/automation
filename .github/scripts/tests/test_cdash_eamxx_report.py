@@ -5,7 +5,7 @@ from collections import Counter
 from unittest.mock import patch
 
 
-SCRIPT = pathlib.Path(__file__).parents[1] / "scripts" / "cdash_eamxx_report.py"
+SCRIPT = pathlib.Path(__file__).parents[1] / "cdash_eamxx_report.py"
 SPEC = importlib.util.spec_from_file_location("cdash_eamxx_report", SCRIPT)
 REPORT = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(REPORT)
