@@ -30,6 +30,12 @@ tests/               # tests for the scripts
 
 Both can also be run manually from the Actions tab (`workflow_dispatch`).
 
+## Current actions
+
+| Action | What it does |
+| --- | --- |
+| `actions/show-trigger` | Prints the event, event action, and actor that triggered the workflow run |
+
 ## Using reusable actions from other repos
 
 Reference an action by its full path, including the owner, the `actions/`
