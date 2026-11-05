@@ -57,3 +57,10 @@ Settings → Actions → General → Access.
   logic that is more than a few lines in `scripts/` (and a test in `tests/`).
 - New shared step: add `actions/<name>/action.yml`.
 - Keep secrets in repository/organization secrets, never in the repo.
+
+## CI
+
+- `lint.yaml`: `actionlint` and schema validation for workflows and `action.yml`
+  files, `ruff` and the unit tests for `scripts/`. Runs on every PR and on `main`.
+- Reusable actions also get a smoke test in `test-actions.yaml` (added together
+  with the first action).

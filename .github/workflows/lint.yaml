@@ -1,0 +1,63 @@
+name: Lint and test
+
+# Static checks on the workflows, action metadata and Python scripts in this
+# repo, plus the script unit tests. Runtime smoke tests of the reusable actions
+# live in test-actions.yaml.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  workflows:
+    name: Lint workflows (actionlint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: actionlint
+        uses: docker://rhysd/actionlint:1.7.7
+        with:
+          args: -color
+
+  action-metadata:
+    name: Validate action.yml schema
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: check-jsonschema
+        run: |
+          pip install check-jsonschema==0.30.0
+          # Workflows against the GitHub workflow schema
+          check-jsonschema --builtin-schema vendor.github-workflows .github/workflows/*.y*ml
+          # Reusable actions against the action-metadata schema (if there are any)
+          shopt -s nullglob
+          actions=(actions/*/action.y*ml)
+          if [ ${#actions[@]} -gt 0 ]; then
+            check-jsonschema --builtin-schema vendor.github-actions "${actions[@]}"
+          fi
+
+  python:
+    name: Lint and test Python
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Lint (ruff)
+        run: |
+          pip install ruff==0.9.10
+          ruff check scripts tests
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
