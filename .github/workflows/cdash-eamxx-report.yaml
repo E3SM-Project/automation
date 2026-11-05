@@ -1,0 +1,55 @@
+name: CDash EAMxx daily report
+
+on:
+  schedule:
+    # 18:00 UTC is 10 AM during daylight time (PDT) and 11 AM during standard
+    # time (PST), allowing most overnight CI results to reach CDash first.
+    - cron: "0 18 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "CDash testing day (YYYY-MM-DD); blank = current"
+        required: false
+      dry_run:
+        description: "Only write the job summary, don't post to Slack"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read   # the job only needs to check out this repo
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build and post report
+        env:
+          INPUT_DATE: ${{ inputs.date }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+          # Preferred: a Slack app's bot token (summary in the channel, details
+          # and the report file in a thread). Needs chat:write and files:write.
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          # Optional repository variable: both (default), thread, or file.
+          SLACK_DETAILS: ${{ vars.SLACK_DETAILS }}
+          # Fallback when there's no bot token: summary plus a link to this run.
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_EAMXX_CDASH_WEBHOOK_URL }}
+        run: |
+          args=()
+          [ -n "$INPUT_DATE" ] && args+=(--date "$INPUT_DATE")
+          [ "$INPUT_DRY_RUN" = "true" ] && args+=(--dry-run)
+          python scripts/cdash_eamxx_report.py "${args[@]}"
+      - name: Save report as artifact
+        # Runs even if the Slack post failed, so the report is never lost.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cdash-eamxx-report
+          path: cdash_report/
+          retention-days: 30
+          if-no-files-found: warn
