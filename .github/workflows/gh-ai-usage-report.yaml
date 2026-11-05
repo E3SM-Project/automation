@@ -1,22 +1,31 @@
 name: AI Usage Report
 
-# This workflow pings the e3sm-project gh org (using a secret private key
+# This workflow pings the e3sm-project gh org (using a GitHub App's private key
 # with proper read privileges) to get the current status of our ai credits
 # usage. Then, it crafts and posts a message on the general-e3sm slack
 # channel on e3sm-project.slack.com
 #
-# It also runs (fetch + validate steps only, no Slack post) on any PR that
-# touches this file, as a check that the REST calls still succeed and that
-# the numbers they produce still parse as numbers.
+# The logic lives in .github/scripts/gh_ai_usage_report.py (with unit tests).
+#
+# It also runs on any PR that touches this file or the script, as a dry run
+# (everything except the Slack post: the message goes to the job summary), as a
+# check that the REST calls still succeed and that the numbers they produce
+# still parse as numbers.
 
 on:
   schedule:
     # Runs daily at 08:00 AM UTC
     - cron: '0 8 * * *'
   workflow_dispatch: # Allows running manually from GitHub UI
+    inputs:
+      dry_run:
+        description: "Only write the job summary, don't post to Slack"
+        type: boolean
+        default: false
   pull_request:
     paths:
       - '.github/workflows/gh-ai-usage-report.yaml'
+      - '.github/scripts/gh_ai_usage_report.py'
 
 permissions:
   contents: read
@@ -28,11 +37,14 @@ jobs:
     # APP_ID. Skip only that case: schedule and manual runs must never be skipped.
     if: ${{ !(github.event_name == 'pull_request' && github.actor == 'dependabot[bot]') }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
       ORG_NAME: ${{ github.repository_owner }}
       SLACK_WEBHOOK_URL: ${{ secrets.SLACK_E3SM_AI_HELP_WEBHOOK_URL }}
     steps:
-      # 1. Mint short-lived installation token from your GitHub App
+      - uses: actions/checkout@v7
+
+      # Mint short-lived installation token from your GitHub App
       - name: Generate GitHub App Token
         id: generate-token
         uses: actions/create-github-app-token@v3
@@ -44,334 +56,25 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
-          python-version: '3.11'
+          python-version: '3.12'
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests
-
-      # 2. Query the GitHub Billing API only. Sets included/additional
-      #    usage and their caps as step outputs, doesn't touch Slack.
-      - name: Fetch usage from GitHub Billing API
-        id: fetch-usage
+      # Query the GitHub billing API, validate the numbers, craft the Slack
+      # message and post it. On a pull_request run (or with dry_run) nothing is
+      # posted: the message is printed and written to the job summary instead.
+      - name: Build and post report
         env:
           GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          python3 - << 'EOF'
-          import os
-          import sys
-          from datetime import datetime, timezone
+          args=()
+          [ "$INPUT_DRY_RUN" = "true" ] && args+=(--dry-run)
+          python .github/scripts/gh_ai_usage_report.py "${args[@]}"
 
-          import requests
-
-          gh_token = os.environ["GH_TOKEN"]
-          org_name = os.environ["ORG_NAME"]
-
-          headers = {
-              "Authorization": f"Bearer {gh_token}",
-              "Accept": "application/vnd.github+json",
-              "X-GitHub-Api-Version": "2022-11-28",
-          }
-
-          def get_paginated(url, list_key):
-              items = []
-              try:
-                  while url:
-                      response = requests.get(url, headers=headers, timeout=15)
-                      response.raise_for_status()
-                      items.extend(response.json().get(list_key, []))
-                      url = response.links.get("next", {}).get("url")
-              except requests.RequestException as exc:
-                  print(f"::error::GET {url} failed: {exc}")
-                  sys.exit(1)
-              return items
-
-          current_month_prefix = datetime.now(timezone.utc).strftime("%Y-%m")
-
-          # 1. Usage line items: discountAmount is the $ portion covered by
-          # the included AI-credit pool, netAmount is what was actually
-          # billed as overage.
-          #
-          # Both sums exclude "UserMonths"-billed items, since those are flat
-          # per-seat subscription fees, not AI credit consumption. The org's
-          # budget (see step 3) is now an "All AI Credit SKUs" budget, which
-          # only tracks AI-credit spend, so seat fees must not count
-          # against it (including them reported e.g. $51.48 spent while the
-          # GitHub budget page showed $0).
-          usage_items = get_paginated(
-              f"https://api.github.com/orgs/{org_name}/settings/billing/usage", "usageItems"
-          )
-          if not usage_items:
-              print(
-                  f"::error::Billing usage API returned no usageItems for `{org_name}`. "
-                  "Check the GitHub App's Administration (read) permission and installation scope."
-              )
-              sys.exit(1)
-
-          included_dollars_used = 0.0
-          used_additional_dollars = 0.0
-          for item in usage_items:
-              if item.get("product") != "copilot":
-                  continue
-              if not item.get("date", "").startswith(current_month_prefix):
-                  continue
-              print(
-                  f"item: sku={item.get('sku')!r} unitType={item.get('unitType')!r} "
-                  f"gross={item.get('grossAmount')} discount={item.get('discountAmount')} "
-                  f"net={item.get('netAmount')}"
-              )
-              if item.get("unitType") == "UserMonths":
-                  continue
-              used_additional_dollars += item.get("netAmount", 0.0)
-              included_dollars_used += item.get("discountAmount", 0.0)
-
-          included_credits_used = included_dollars_used * 100  # 1 AI credit = $0.01
-
-          # 2. Included-credit pool size = seat count * per-seat monthly
-          # credit allotment. GitHub doesn't expose the pool total directly,
-          # so it's derived here; update PER_SEAT_CREDITS if GitHub changes
-          # a plan's allotment or E3SM changes plans.
-          PER_SEAT_CREDITS = {
-              "business": 1900,
-              "enterprise": 3900,
-          }
-          seats_res = requests.get(
-              f"https://api.github.com/orgs/{org_name}/copilot/billing", headers=headers, timeout=15
-          )
-          try:
-              seats_res.raise_for_status()
-          except requests.RequestException as exc:
-              print(f"::error::Failed to fetch Copilot seat info for `{org_name}`: {exc}")
-              sys.exit(1)
-
-          seat_data = seats_res.json()
-          plan_type = seat_data.get("plan_type")
-          seat_count = seat_data.get("seat_breakdown", {}).get("total")
-          if plan_type not in PER_SEAT_CREDITS or seat_count is None:
-              print(
-                  f"::error::Unrecognized Copilot plan_type={plan_type!r} or missing seat count "
-                  f"for `{org_name}` - add the plan to PER_SEAT_CREDITS."
-              )
-              sys.exit(1)
-
-          included_credits_cap = seat_count * PER_SEAT_CREDITS[plan_type]
-
-          # 3. Additional budget cap: read the org-level "copilot"
-          # ProductPricing budget - the "Edit budget" cap set in the
-          # GitHub UI - instead of hardcoding it.
-          # 3. Additional budget cap: read the org-level AI budget cap set in the GitHub UI
-
-          budgets = get_paginated(
-            f"https://api.github.com/orgs/{org_name}/settings/billing/budgets", "budgets"
-          )
-
-          additional_budget_cap = next(
-              (
-                  b.get("budget_amount")
-                  for b in budgets
-                  if b.get("budget_scope") == "organization"
-                  and b.get("budget_product_sku") in ("ai_credits", "copilot")
-                  
-              ),
-              None,
-          )
-          if additional_budget_cap is None:
-              print(
-                  f"::error::No org-level AI budget found for `{org_name}` - "
-                  "was it renamed or removed in the GitHub UI?"
-              )
-              sys.exit(1)
-
-          print(
-              f"Raw totals: included_credits_used={included_credits_used}, "
-              f"included_credits_cap={included_credits_cap}, "
-              f"used_additional_dollars={used_additional_dollars}, "
-              f"additional_budget_cap={additional_budget_cap}"
-          )
-
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"included_credits_used={included_credits_used}\n")
-              f.write(f"included_credits_cap={included_credits_cap}\n")
-              f.write(f"used_additional_dollars={used_additional_dollars}\n")
-              f.write(f"additional_budget_cap={additional_budget_cap}\n")
-          EOF
-
-      # 3. Sanity-check that the values crossing the step boundary are
-      #    actually numbers (GitHub Actions step outputs are always plain
-      #    strings, so a REST field rename or type change upstream would
-      #    otherwise only show up as a garbled Slack message). Runs on
-      #    every trigger, including PRs.
-      - name: Validate usage numbers
-        id: validate-usage
-        env:
-          INCLUDED_CREDITS_USED: ${{ steps.fetch-usage.outputs.included_credits_used }}
-          INCLUDED_CREDITS_CAP: ${{ steps.fetch-usage.outputs.included_credits_cap }}
-          USED_ADDITIONAL_DOLLARS: ${{ steps.fetch-usage.outputs.used_additional_dollars }}
-          ADDITIONAL_BUDGET_CAP: ${{ steps.fetch-usage.outputs.additional_budget_cap }}
-        run: |
-          python3 - << 'EOF'
-          import math
-          import os
-          import sys
-
-          def validate(name, raw_value):
-              try:
-                  value = float(raw_value)
-              except (TypeError, ValueError):
-                  print(f"::error::{name} is not a valid number: {raw_value!r}")
-                  sys.exit(1)
-              if math.isnan(value) or math.isinf(value):
-                  print(f"::error::{name} is not a finite number: {raw_value!r}")
-                  sys.exit(1)
-              if value < 0:
-                  print(f"::error::{name} is negative, which should not happen: {value}")
-                  sys.exit(1)
-              return value
-
-          values = {
-              name: validate(name, os.environ[name])
-              for name in (
-                  "INCLUDED_CREDITS_USED",
-                  "INCLUDED_CREDITS_CAP",
-                  "USED_ADDITIONAL_DOLLARS",
-                  "ADDITIONAL_BUDGET_CAP",
-              )
-          }
-          if values["INCLUDED_CREDITS_CAP"] == 0 or values["ADDITIONAL_BUDGET_CAP"] == 0:
-              print(f"::error::A cap came back as 0, which should not happen: {values}")
-              sys.exit(1)
-
-          print(f"OK: {values}")
-          EOF
-
-      # 4. Craft the Slack Block Kit message. On a real (non-PR) trigger,
-      #    post it to Slack as usual. On a pull_request run, don't touch
-      #    Slack at all - print the message and write it to the job's Step
-      #    Summary instead, so reviewers can see exactly what would be
-      #    posted without merging and without spamming the channel.
-      - name: Craft and post Slack message
-        env:
-          INCLUDED_CREDITS_USED: ${{ steps.fetch-usage.outputs.included_credits_used }}
-          INCLUDED_CREDITS_CAP: ${{ steps.fetch-usage.outputs.included_credits_cap }}
-          USED_ADDITIONAL_DOLLARS: ${{ steps.fetch-usage.outputs.used_additional_dollars }}
-          ADDITIONAL_BUDGET_CAP: ${{ steps.fetch-usage.outputs.additional_budget_cap }}
-        run: |
-          python3 - << 'EOF'
-          import calendar
-          import os
-          from datetime import datetime, timezone
-
-          import requests
-
-          org_name = os.environ["ORG_NAME"]
-          webhook_url = os.environ["SLACK_WEBHOOK_URL"]
-          included_credits_used = float(os.environ["INCLUDED_CREDITS_USED"])
-          included_cap = float(os.environ["INCLUDED_CREDITS_CAP"])
-          used_additional_dollars = float(os.environ["USED_ADDITIONAL_DOLLARS"])
-          budget_cap = float(os.environ["ADDITIONAL_BUDGET_CAP"])
-
-          base_credits_used = min(included_credits_used, included_cap)
-          base_pct = (base_credits_used / included_cap) * 100.0 if included_cap > 0 else 0.0
-          additional_pct = (used_additional_dollars / budget_cap) * 100.0 if budget_cap > 0 else 0.0
-
-          # Month-to-date pace. License credits burn first and additional
-          # credits second, so the two pools are best viewed as one combined
-          # allotment (1 AI credit = $0.01) compared against the share of the
-          # month that has elapsed (linear trajectory).
-          now = datetime.now(timezone.utc)
-          days_in_month = calendar.monthrange(now.year, now.month)[1]
-          elapsed_pct = now.day / days_in_month * 100.0
-          total_allotment = included_cap + budget_cap * 100
-          total_used = base_credits_used + used_additional_dollars * 100
-          total_pct = total_used / total_allotment * 100.0
-          pace_delta = total_pct - elapsed_pct
-          if abs(pace_delta) < 2.0:
-              pace_verdict = "on pace"
-          elif pace_delta > 0:
-              pace_verdict = f"{pace_delta:.1f} pts AHEAD of pace"
-          else:
-              pace_verdict = f"{-pace_delta:.1f} pts behind pace"
-
-          if used_additional_dollars > budget_cap:
-              status_emoji = ":red_circle:"
-              status_label = f"BUDGET EXCEEDED (Over by ${used_additional_dollars - budget_cap:,.2f})"
-          elif additional_pct >= 85.0:
-              status_emoji = ":warning:"
-              status_label = "Warning - Additional budget over 85% depleted"
-          else:
-              status_emoji = ":large_green_circle:"
-              status_label = "Normal"
-
-          included_line = f"Included Credits: {base_credits_used:,.0f} / {included_cap:,.0f} credits ({base_pct:.1f}%)"
-          additional_line = f"Additional Budget: ${used_additional_dollars:,.2f} / ${budget_cap:,.2f} ({additional_pct:.1f}%)"
-
-          pace_line = (
-              f"Overall: {total_pct:.1f}% used vs {elapsed_pct:.1f}% of month "
-              f"(day {now.day}/{days_in_month}) - {pace_verdict} "
-              f"(${total_used / 100:,.0f} used vs ${total_allotment * elapsed_pct / 100 / 100:,.0f} expected)"
-          )
-
-          slack_payload = {
-              "blocks": [
-                  {
-                      "type": "header",
-                      "text": {
-                          "type": "plain_text",
-                          "text": f"{org_name} GitHub AI usage report",
-                      },
-                  },
-                  {
-                      "type": "section",
-                      "text": {
-                          "type": "mrkdwn",
-                          "text": (
-                              f"{status_emoji} *Status:* {status_label}\n\n"
-                              f"* *{included_line}*\n"
-                              f"* *{additional_line}*\n"
-                              f"* *{pace_line}*"
-                          ),
-                      },
-                  },
-                  {
-                      "type": "context",
-                      "elements": [
-                          {"type": "mrkdwn", "text": "Automated daily report generated via GitHub Actions."}
-                      ],
-                  },
-              ]
-          }
-
-          if os.environ.get("GITHUB_EVENT_NAME") == "pull_request":
-              print("pull_request run - not posting to Slack. Message that would be posted:\n")
-              print(f"{org_name} GitHub AI usage report")
-              print(f"{status_emoji} Status: {status_label}\n")
-              print(included_line)
-              print(additional_line)
-              print(pace_line)
-
-              summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
-              if summary_path:
-                  with open(summary_path, "a") as f:
-                      f.write(f"## {org_name} GitHub AI usage report (PR preview - not posted to Slack)\n\n")
-                      f.write(f"{status_emoji} **Status:** {status_label}\n\n")
-                      f.write(f"- **{included_line}**\n")
-                      f.write(f"- **{additional_line}**\n")
-                      f.write(f"- **{pace_line}**\n")
-          else:
-              res = requests.post(webhook_url, json=slack_payload, timeout=10)
-              res.raise_for_status()
-              print("Successfully posted report to Slack!")
-              print(included_line)
-              print(additional_line)
-              print(pace_line)
-          EOF
-
-      # 5. If steps 2-4 failed on a real (non-PR) run, alert Slack instead
-      #    of failing silently. PR runs surface failures via the check
-      #    itself, so no alert needed there.
+      # If the report failed on a real (non-PR, non-dry) run, alert Slack
+      # instead of failing silently. PR runs surface failures via the check
+      # itself, so no alert needed there.
       - name: Alert Slack on failure
-        if: failure() && github.event_name != 'pull_request'
+        if: ${{ failure() && github.event_name != 'pull_request' && inputs.dry_run != true }}
         run: |
           curl -sS -X POST -H 'Content-Type: application/json' \
             -d "{\"text\": \":red_circle: AI Usage Report workflow failed for \`${ORG_NAME}\` - see ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\"}" \

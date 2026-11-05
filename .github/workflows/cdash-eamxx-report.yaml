@@ -53,3 +53,27 @@ jobs:
           path: cdash_report/
           retention-days: 30
           if-no-files-found: warn
+      - name: Alert Slack on failure
+        # The script exits 1 if CDash can't be reached and 2 if posting to Slack
+        # failed. In the first case nobody would otherwise hear about it. If Slack
+        # itself is the problem this step may fail too, which is why it can't fail
+        # the job any further.
+        if: ${{ failure() && inputs.dry_run != true }}
+        continue-on-error: true
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_EAMXX_CDASH_WEBHOOK_URL }}
+        run: |
+          text=":red_circle: CDash EAMxx daily report workflow failed - see ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          if [ -n "$SLACK_BOT_TOKEN" ] && [ -n "$SLACK_CHANNEL_ID" ]; then
+            jq -n --arg c "$SLACK_CHANNEL_ID" --arg t "$text" '{channel: $c, text: $t}' |
+              curl -sS -X POST https://slack.com/api/chat.postMessage \
+                -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+                -H 'Content-Type: application/json; charset=utf-8' --data @-
+          elif [ -n "$SLACK_WEBHOOK_URL" ]; then
+            jq -n --arg t "$text" '{text: $t}' |
+              curl -sS -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL"
+          else
+            echo "No Slack credentials available; not alerting"
+          fi
