@@ -40,6 +40,7 @@ Both can also be run manually from the Actions tab (`workflow_dispatch`).
 | Action | What it does |
 | --- | --- |
 | `show-trigger` | Prints the event, actor, ref/SHA, and event-specific details (PR, push, inputs, ...) that triggered the run, also as a job summary |
+| `gpu-arch` | Detects the runner's GPU (Nvidia or AMD) and outputs the Kokkos arch and CMake configs |
 
 ## Using reusable actions from other repos
 

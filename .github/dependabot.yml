@@ -8,6 +8,7 @@ updates:
     directories:
       - "/"
       - "/show-trigger"
+      - "/gpu-arch"
     schedule:
       interval: "weekly"
     groups:
