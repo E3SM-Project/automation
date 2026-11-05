@@ -33,7 +33,10 @@ dot (`.github` is taken).
 | `cdash-eamxx-report.yaml` | weekdays, 18:00 UTC | Summarizes the EAMxx CDash results and posts them to Slack |
 | `gh-ai-usage-report.yaml` | daily, 08:00 UTC | Reports the organization's GitHub AI credit usage to Slack |
 
-Both can also be run manually from the Actions tab (`workflow_dispatch`).
+Both can also be run manually from the Actions tab (`workflow_dispatch`), with a
+`dry_run` option that only writes the job summary and doesn't post to Slack. If a
+scheduled run fails, both post a failure alert to Slack. The AI-usage workflow also
+runs as a dry run on PRs that touch it or its script.
 
 ## Current actions
 
