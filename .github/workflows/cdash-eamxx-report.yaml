@@ -43,7 +43,7 @@ jobs:
           args=()
           [ -n "$INPUT_DATE" ] && args+=(--date "$INPUT_DATE")
           [ "$INPUT_DRY_RUN" = "true" ] && args+=(--dry-run)
-          python scripts/cdash_eamxx_report.py "${args[@]}"
+          python .github/scripts/cdash_eamxx_report.py "${args[@]}"
       - name: Save report as artifact
         # Runs even if the Slack post failed, so the report is never lost.
         if: always()

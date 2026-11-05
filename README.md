@@ -10,21 +10,21 @@ The repo holds three kinds of things:
   future, any other bot-like task such as issue/PR housekeeping or reminders).
 - **Reusable actions and workflows** that other repos in the organization can
   call, instead of each copying the same steps.
-- **Supporting scripts and tests** used by the above.
+- **Supporting scripts and their tests** used by the above, in `.github/scripts/`.
 
 ## Layout
 
 ```
-.github/workflows/   # scheduled/bot workflows (and reusable workflows)
-<name>/              # one directory per reusable composite action: action.yml,
-                     #   README.md, and (optionally) tests/ with its test fixtures
-scripts/             # scripts called by the workflows
-tests/               # tests for the scripts
+<name>/                 # one directory per reusable composite action: action.yml,
+                        #   README.md, and (optionally) tests/ with its test fixtures
+.github/workflows/      # scheduled/bot workflows (and reusable workflows)
+.github/scripts/        # scripts called by the workflows
+.github/scripts/tests/  # unit tests for those scripts
+```
 
 Action directories live at the repo root, so they can be referenced as
-`E3SM-Project/automation/<name>@<ref>`. An action can't be named `scripts`,
-`tests`, or start with a dot, since those names are taken.
-```
+`E3SM-Project/automation/<name>@<ref>`. An action directory can't start with a
+dot (`.github` is taken).
 
 ## Current workflows
 
@@ -66,7 +66,8 @@ Settings → Actions → General → Access.
 ## Adding something new
 
 - New bot/scheduled task: add a workflow under `.github/workflows/`, with any
-  logic that is more than a few lines in `scripts/` (and a test in `tests/`).
+  logic that is more than a few lines in `.github/scripts/` (and a test in
+  `.github/scripts/tests/`).
 - New shared step: add `<name>/action.yml` (+ `README.md`), add its directory to
   `.github/dependabot.yml`, and add a job for it in
   `.github/workflows/test-actions.yaml` (copy the `show-trigger` one).
@@ -75,6 +76,6 @@ Settings → Actions → General → Access.
 ## CI
 
 - `lint.yaml`: `actionlint` and schema validation for workflows and `action.yml`
-  files, `ruff` and the unit tests for `scripts/`. Runs on every PR and on `main`.
+  files, `ruff` and the unit tests for `.github/scripts/`. Runs on every PR and on `main`.
 - Reusable actions also get a smoke test in `test-actions.yaml` (added together
   with the first action).
