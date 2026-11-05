@@ -69,13 +69,46 @@ Settings → Actions → General → Access.
   logic that is more than a few lines in `.github/scripts/` (and a test in
   `.github/scripts/tests/`).
 - New shared step: add `<name>/action.yml` (+ `README.md`), add its directory to
-  `.github/dependabot.yml`, and add a job for it in
-  `.github/workflows/test-actions.yaml` (copy the `show-trigger` one).
+  `.github/dependabot.yml`, add a job for it in
+  `.github/workflows/test-actions.yaml` (copy the `show-trigger` one), and a row
+  in the "Current actions" table above. CI (`check_actions.py`) fails if any of
+  these is missing.
 - Keep secrets in repository/organization secrets, never in the repo.
+
+## Releasing
+
+Consumers pin a tag, so a change only reaches other repos when a tag moves.
+Merging to `main` on its own affects nobody. All actions in this repo share the
+same tags.
+
+- Tags are `vMAJOR.MINOR.PATCH` (e.g. `v1.2.0`, never moved) plus a floating
+  `vMAJOR` (e.g. `v1`) that always points at the latest release of that major.
+- **Non-breaking changes** (fixes, new outputs, new actions): tag a new
+  `v1.x.y` and move `v1` to it.
+- **Breaking changes** (renamed or removed inputs/outputs, changed behavior that
+  consumers rely on): start a new major (`v2`) and leave `v1` where it is, so
+  existing users keep working until they choose to move.
+- Release from `main` once CI is green:
+
+  ```bash
+  git tag -a v1.2.0 -m "<what changed>"
+  git tag -fa v1 -m "v1 -> v1.2.0"
+  git push origin v1.2.0
+  git push --force origin v1
+  ```
+
+- Only maintainers should be able to create or move `v*` tags (a tag ruleset on
+  the repo). It must allow updating tags, since moving `vMAJOR` is an update.
+- Consumers who want the strongest guarantee can pin `vX.Y.Z` or a commit SHA
+  instead of `vMAJOR`.
 
 ## CI
 
 - `lint.yaml`: `actionlint` and schema validation for workflows and `action.yml`
-  files, `ruff` and the unit tests for `.github/scripts/`. Runs on every PR and on `main`.
-- Reusable actions also get a smoke test in `test-actions.yaml` (added together
-  with the first action).
+  files, `ruff`, the unit tests and `check_actions.py` (every action is in
+  `dependabot.yml`, `test-actions.yaml` and the README table) for
+  `.github/scripts/`. Runs on every PR and on `main`.
+- `test-actions.yaml`: runs each reusable action for real on a runner (smoke
+  tests), on PRs that touch an action.
+- `dependabot.yml`: weekly grouped updates of the actions used by the workflows
+  and by our own actions.
