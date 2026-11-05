@@ -5,7 +5,7 @@ job log and as a table in the job summary.
 
 ```yaml
 steps:
-  - uses: E3SM-Project/automation/actions/show-trigger@v1
+  - uses: E3SM-Project/automation/show-trigger@v1
 ```
 
 No inputs. One output, `collected`: `'true'` if everything was printed, `'false'` if

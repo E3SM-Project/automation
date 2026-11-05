@@ -1,8 +1,9 @@
 name: Test actions
 
-# Smoke tests for the reusable actions in actions/. Each action runs for real
-# on a runner (via a local `uses: ./actions/<name>`), so a broken action.yml or
-# a failing step is caught before anyone pins a tag to it.
+# Smoke tests for the reusable actions (the <name>/action.yml directories at
+# the repo root). Each action runs for real on a runner (via a local
+# `uses: ./<name>`), so a broken action.yml or a failing step is caught before
+# anyone pins a tag to it.
 #
 # To add a new action: copy the show-trigger job below, point `uses:` at the new
 # directory, and add whatever assertions make sense for that action.
@@ -10,7 +11,8 @@ name: Test actions
 on:
   pull_request:
     paths:
-      - 'actions/**'
+      - '*/action.yml'
+      - '*/tests/**'
       - '.github/workflows/test-actions.yaml'
   workflow_dispatch:
 
@@ -25,7 +27,7 @@ jobs:
       - uses: actions/checkout@v7
       - name: Run the action
         id: trigger
-        uses: ./actions/show-trigger
+        uses: ./show-trigger
       # The action never fails the job on its own (errors become warnings), so
       # check its output. (A later step can't read the job summary written by an
       # earlier one: each step gets its own $GITHUB_STEP_SUMMARY file.)

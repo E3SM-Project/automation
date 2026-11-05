@@ -16,9 +16,14 @@ The repo holds three kinds of things:
 
 ```
 .github/workflows/   # scheduled/bot workflows (and reusable workflows)
-actions/<name>/      # reusable composite actions, each with an action.yml
+<name>/              # one directory per reusable composite action: action.yml,
+                     #   README.md, and (optionally) tests/ with its test fixtures
 scripts/             # scripts called by the workflows
 tests/               # tests for the scripts
+
+Action directories live at the repo root, so they can be referenced as
+`E3SM-Project/automation/<name>@<ref>`. An action can't be named `scripts`,
+`tests`, or start with a dot, since those names are taken.
 ```
 
 ## Current workflows
@@ -34,16 +39,16 @@ Both can also be run manually from the Actions tab (`workflow_dispatch`).
 
 | Action | What it does |
 | --- | --- |
-| `actions/show-trigger` | Prints the event, actor, ref/SHA, and event-specific details (PR, push, inputs, ...) that triggered the run, also as a job summary |
+| `show-trigger` | Prints the event, actor, ref/SHA, and event-specific details (PR, push, inputs, ...) that triggered the run, also as a job summary |
 
 ## Using reusable actions from other repos
 
-Reference an action by its full path, including the owner, the `actions/`
-directory, and a ref (tag, branch, or SHA):
+Reference an action by owner, repo, directory name, and a ref (tag, branch, or
+SHA). Pin a tag or SHA, not a branch:
 
 ```yaml
 steps:
-  - uses: E3SM-Project/automation/actions/<name>@v1
+  - uses: E3SM-Project/automation/<name>@v1
 ```
 
 Reusable workflows live in `.github/workflows/` and are called with:
@@ -61,7 +66,8 @@ Settings → Actions → General → Access.
 
 - New bot/scheduled task: add a workflow under `.github/workflows/`, with any
   logic that is more than a few lines in `scripts/` (and a test in `tests/`).
-- New shared step: add `actions/<name>/action.yml`, and add a job for it in
+- New shared step: add `<name>/action.yml` (+ `README.md`), add its directory to
+  `.github/dependabot.yml`, and add a job for it in
   `.github/workflows/test-actions.yaml` (copy the `show-trigger` one).
 - Keep secrets in repository/organization secrets, never in the repo.
 
