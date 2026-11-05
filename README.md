@@ -34,7 +34,7 @@ Both can also be run manually from the Actions tab (`workflow_dispatch`).
 
 | Action | What it does |
 | --- | --- |
-| `actions/show-trigger` | Prints the event, event action, and actor that triggered the workflow run |
+| `actions/show-trigger` | Prints the event, actor, ref/SHA, and event-specific details (PR, push, inputs, ...) that triggered the run, also as a job summary |
 
 ## Using reusable actions from other repos
 
