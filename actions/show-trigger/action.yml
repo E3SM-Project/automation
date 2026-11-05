@@ -93,7 +93,9 @@ runs:
             const esc = s => String(s ?? '').replace(/\|/g, '\\|');
             await core.summary
               .addHeading('Workflow trigger', 3)
-              .addRaw('| | |\n| --- | --- |\n' + rows.map(([k, v]) => `| ${esc(k)} | ${esc(v)} |`).join('\n') + '\n', true)
+              // Leading blank line: a table right after the HTML <h3> would otherwise be
+              // swallowed by the HTML block and shown as raw text.
+              .addRaw('\n| Field | Value |\n| --- | --- |\n' + rows.map(([k, v]) => `| ${esc(k)} | ${esc(v)} |`).join('\n') + '\n', true)
               .write();
             core.setOutput('collected', 'true');
           } catch (e) {
