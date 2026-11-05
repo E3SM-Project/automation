@@ -1,0 +1,79 @@
+name: 'GPU arch'
+description: |
+  Detect the GPU of the runner (Nvidia via nvidia-smi, AMD via rocminfo) and
+  output the matching Kokkos architecture and CMake configs.
+  Only the first GPU is looked at, so the runner should be homogeneous.
+  Fails if no GPU tool is found, if it fails, or if the GPU is not supported.
+  To support a new GPU, add it to the two tables in the script below.
+
+outputs:
+  vendor:
+    description: "'nvidia' or 'amd'"
+    value: ${{ steps.detect.outputs.vendor }}
+  gpu:
+    description: "What was detected: the GPU model (nvidia) or the gfx target (amd)"
+    value: ${{ steps.detect.outputs.gpu }}
+  kokkos-arch:
+    description: "Kokkos arch name, e.g. HOPPER90 or AMD_GFX942 (for -DKokkos_ARCH_<name>=ON)"
+    value: ${{ steps.detect.outputs.kokkos-arch }}
+  cmake-configs:
+    description: |
+      Semicolon-separated list of key=value CMake configs, e.g.
+      'Kokkos_ARCH_HOPPER90=ON;CMAKE_CUDA_ARCHITECTURES=90' (nvidia) or
+      'Kokkos_ARCH_AMD_GFX942=ON' (amd)
+    value: ${{ steps.detect.outputs.cmake-configs }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Detect GPU
+      id: detect
+      shell: bash
+      run: |
+        fail() { echo "::error title=gpu-arch::$1"; exit 1; }
+
+        if command -v nvidia-smi > /dev/null 2>&1; then
+          vendor=nvidia
+          # Capture first, then take the first line, so head can't SIGPIPE the tool
+          out=$(nvidia-smi --query-gpu=name --format=csv,noheader) \
+            || fail "nvidia-smi failed. Please ensure the Nvidia drivers are working."
+          gpu=$(printf '%s\n' "$out" | head -n 1)
+
+          # Supported Nvidia GPUs: <model pattern> -> Kokkos arch, compute capability
+          case "$gpu" in
+            *H100*) arch=HOPPER90; cc=90 ;;
+            *A100*) arch=AMPERE80; cc=80 ;;
+            *V100*) arch=VOLTA70;  cc=70 ;;
+            *) fail "Unsupported GPU model: '$gpu'" ;;
+          esac
+          configs="Kokkos_ARCH_${arch}=ON;CMAKE_CUDA_ARCHITECTURES=${cc}"
+
+        elif command -v rocminfo > /dev/null 2>&1; then
+          vendor=amd
+          out=$(rocminfo) || fail "rocminfo failed. Please ensure ROCm is working."
+          # First gfx target in the output (the CPU agents don't have one)
+          gpu=$(printf '%s\n' "$out" | grep -o -m 1 'gfx[0-9a-f]\+' || true)
+
+          # Supported AMD GPUs: <gfx target> -> Kokkos arch
+          case "$gpu" in
+            gfx942) arch=AMD_GFX942 ;;
+            gfx90a) arch=AMD_GFX90A ;;
+            gfx908) arch=AMD_GFX908 ;;
+            *) fail "Unsupported GPU architecture: '$gpu'" ;;
+          esac
+          configs="Kokkos_ARCH_${arch}=ON"
+
+        else
+          fail "Neither nvidia-smi nor rocminfo found. Is this a GPU runner, with the drivers installed?"
+        fi
+
+        echo "GPU vendor   : $vendor"
+        echo "GPU          : $gpu"
+        echo "Kokkos arch  : $arch"
+        echo "CMake configs: $configs"
+        {
+          echo "vendor=$vendor"
+          echo "gpu=$gpu"
+          echo "kokkos-arch=$arch"
+          echo "cmake-configs=$configs"
+        } >> "$GITHUB_OUTPUT"

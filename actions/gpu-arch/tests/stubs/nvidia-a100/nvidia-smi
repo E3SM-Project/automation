@@ -1,0 +1,2 @@
+#!/bin/sh
+echo "NVIDIA A100-SXM4-40GB"

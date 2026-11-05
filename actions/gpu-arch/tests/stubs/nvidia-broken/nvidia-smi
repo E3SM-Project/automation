@@ -1,0 +1,2 @@
+#!/bin/sh
+echo "NVIDIA-SMI has failed" >&2; exit 9

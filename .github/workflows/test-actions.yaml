@@ -31,3 +31,46 @@ jobs:
       # earlier one: each step gets its own $GITHUB_STEP_SUMMARY file.)
       - name: Check the action collected everything
         run: test "${{ steps.trigger.outputs.collected }}" = "true"
+
+  gpu-arch:
+    # No GPUs on hosted runners: put stub nvidia-smi/rocminfo scripts (see
+    # actions/gpu-arch/tests/stubs/<case>/) on PATH and check what the action reports.
+    name: gpu-arch (${{ matrix.case }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {case: nvidia-h100, outcome: success, vendor: nvidia, arch: HOPPER90, configs: "Kokkos_ARCH_HOPPER90=ON;CMAKE_CUDA_ARCHITECTURES=90"}
+          - {case: nvidia-a100, outcome: success, vendor: nvidia, arch: AMPERE80, configs: "Kokkos_ARCH_AMPERE80=ON;CMAKE_CUDA_ARCHITECTURES=80"}
+          - {case: nvidia-v100, outcome: success, vendor: nvidia, arch: VOLTA70, configs: "Kokkos_ARCH_VOLTA70=ON;CMAKE_CUDA_ARCHITECTURES=70"}
+          - {case: amd-gfx942, outcome: success, vendor: amd, arch: AMD_GFX942, configs: "Kokkos_ARCH_AMD_GFX942=ON"}
+          - {case: amd-gfx90a, outcome: success, vendor: amd, arch: AMD_GFX90A, configs: "Kokkos_ARCH_AMD_GFX90A=ON"}
+          - {case: amd-gfx908, outcome: success, vendor: amd, arch: AMD_GFX908, configs: "Kokkos_ARCH_AMD_GFX908=ON"}
+          # The action must fail loudly on these
+          - {case: nvidia-unsupported, outcome: failure}
+          - {case: nvidia-broken, outcome: failure}
+          - {case: amd-unsupported, outcome: failure}
+          - {case: none, outcome: failure}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Put the stub GPU tools on PATH
+        run: echo "$GITHUB_WORKSPACE/actions/gpu-arch/tests/stubs/${{ matrix.case }}" >> "$GITHUB_PATH"
+      - name: Run the action
+        id: gpu
+        uses: ./actions/gpu-arch
+        continue-on-error: true  # the expected-failure cases; checked below
+      - name: Check the result
+        env:
+          OUTCOME: ${{ steps.gpu.outcome }}
+          VENDOR: ${{ steps.gpu.outputs.vendor }}
+          ARCH: ${{ steps.gpu.outputs.kokkos-arch }}
+          CONFIGS: ${{ steps.gpu.outputs.cmake-configs }}
+        run: |
+          test "$OUTCOME" = "${{ matrix.outcome }}"
+          if [ "${{ matrix.outcome }}" = success ]; then
+            test "$VENDOR" = "${{ matrix.vendor }}"
+            test "$ARCH" = "${{ matrix.arch }}"
+            test "$CONFIGS" = "${{ matrix.configs }}"
+          fi

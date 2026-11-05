@@ -1,0 +1,2 @@
+#!/bin/sh
+printf "NVIDIA H100 80GB HBM3\nNVIDIA H100 80GB HBM3\n"

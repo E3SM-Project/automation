@@ -1,0 +1,14 @@
+#!/bin/sh
+cat <<'EOT'
+ROCk module is loaded
+Agent 1
+  Name:                    AMD EPYC 7763 64-Core Processor
+  Device Type:             CPU
+Agent 2
+  Name:                    gfx90a
+  Marketing Name:          AMD Instinct MI250X
+  Device Type:             GPU
+  ISA Info:
+    ISA 1
+      Name:                    amdgcn-amd-amdhsa--gfx90a:sramecc+:xnack-
+EOT
