@@ -8,7 +8,8 @@ steps:
   - uses: E3SM-Project/automation/actions/show-trigger@v1
 ```
 
-No inputs or outputs.
+No inputs. One output, `collected`: `'true'` if everything was printed, `'false'` if
+an error was swallowed (useful for tests; the action never fails the job itself).
 
 ## What it prints
 

@@ -2,12 +2,18 @@ name: 'Show trigger'
 description: |
   Prints what triggered this workflow run (event, action, actor, ref/sha, and
   event-specific details), and mirrors it in the job summary.
-  Only logs: no inputs, no outputs, no API calls, and it never fails the job.
+  Only logs: no inputs, no API calls, and it never fails the job.
+
+outputs:
+  collected:
+    description: "'true' if all the info was collected and printed, 'false' if an error was swallowed"
+    value: ${{ steps.show.outputs.collected }}
 
 runs:
   using: "composite"
   steps:
     - name: Print trigger info
+      id: show
       uses: actions/github-script@v9
       with:
         script: |
@@ -89,7 +95,9 @@ runs:
               .addHeading('Workflow trigger', 3)
               .addRaw('| | |\n| --- | --- |\n' + rows.map(([k, v]) => `| ${esc(k)} | ${esc(v)} |`).join('\n') + '\n', true)
               .write();
+            core.setOutput('collected', 'true');
           } catch (e) {
             // This action is informational: never fail the workflow because of it.
             core.warning(`show-trigger could not collect all info: ${e.message}`);
+            core.setOutput('collected', 'false');
           }

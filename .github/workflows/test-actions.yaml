@@ -24,8 +24,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Run the action
+        id: trigger
         uses: ./actions/show-trigger
-      - name: Check the job summary was written
-        run: |
-          grep -q "Workflow trigger" "$GITHUB_STEP_SUMMARY"
-          grep -q "Event" "$GITHUB_STEP_SUMMARY"
+      # The action never fails the job on its own (errors become warnings), so
+      # check its output. (A later step can't read the job summary written by an
+      # earlier one: each step gets its own $GITHUB_STEP_SUMMARY file.)
+      - name: Check the action collected everything
+        run: test "${{ steps.trigger.outputs.collected }}" = "true"
