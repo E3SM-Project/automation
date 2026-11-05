@@ -41,7 +41,7 @@ jobs:
           check-jsonschema --builtin-schema vendor.github-workflows .github/workflows/*.y*ml
           # Reusable actions against the action-metadata schema (if there are any)
           shopt -s nullglob
-          actions=(actions/*/action.y*ml)
+          actions=(*/action.y*ml)
           if [ ${#actions[@]} -gt 0 ]; then
             check-jsonschema --builtin-schema vendor.github-actions "${actions[@]}"
           fi
