@@ -34,7 +34,7 @@ jobs:
   report-usage:
     # Dependabot's PR runs can't read this repo's Actions secrets (they get a
     # separate set of Dependabot secrets), so the fetch would fail on the empty
-    # APP_ID. Skip only that case: schedule and manual runs must never be skipped.
+    # App credentials. Skip only that case: schedule and manual runs must never be skipped.
     if: ${{ !(github.event_name == 'pull_request' && github.actor == 'dependabot[bot]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -44,12 +44,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Mint short-lived installation token from your GitHub App
+      # Mint a short-lived token from the org's GitHub App. The App exists only
+      # for this: the workflow's own token can't read org billing.
+      # GH_APP_CLIENT_ID is the App's Client ID (Iv..., not its numeric App ID),
+      # a variable; APP_PRIVATE_KEY is its private key, a secret.
       - name: Generate GitHub App Token
         id: generate-token
         uses: actions/create-github-app-token@v3
         with:
-          app-id: ${{ secrets.APP_ID }}
+          client-id: ${{ vars.GH_APP_CLIENT_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
 

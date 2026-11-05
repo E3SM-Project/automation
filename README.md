@@ -38,6 +38,31 @@ Both can also be run manually from the Actions tab (`workflow_dispatch`), with a
 scheduled run fails, both post a failure alert to Slack. The AI-usage workflow also
 runs as a dry run on PRs that touch it or its script.
 
+## Secrets and variables
+
+Set under the repo's Settings → Secrets and variables → Actions (secrets on the
+Secrets tab, variables on the Variables tab).
+
+**Needed by the workflows:**
+
+| Name | Kind | Used by | What it is |
+| --- | --- | --- | --- |
+| `GH_APP_CLIENT_ID` | variable | AI usage report | Client ID (`Iv...`, not the numeric App ID) of the **GitHub** App that mints a short-lived token to read the org's billing. Not a Slack app |
+| `APP_PRIVATE_KEY` | secret | AI usage report | Private key of that same GitHub App; goes together with `GH_APP_CLIENT_ID` |
+| `SLACK_E3SM_AI_HELP_WEBHOOK_URL` | secret | AI usage report | Slack incoming webhook for the channel that gets the report (also used for the failure alert) |
+| `SLACK_EAMXX_CDASH_WEBHOOK_URL` | secret | CDash report | Slack incoming webhook for the CDash report: it posts the summary and a link to the run (also used for the failure alert) |
+
+**Optional, not currently set.** If the CDash report has a Slack bot token and a
+channel it posts a richer report instead (a short summary in the channel, the
+details in a thread, and the full report as a file); without them it uses the
+webhook above:
+
+| Name | Kind | What it is |
+| --- | --- | --- |
+| `SLACK_BOT_TOKEN` | secret | Bot token (`xoxb-...`) of a Slack app with the `chat:write` and `files:write` scopes. Needs `SLACK_CHANNEL_ID` too |
+| `SLACK_CHANNEL_ID` | secret | ID of the Slack channel (like `C0123ABCD`, not its name); the bot must be invited to it |
+| `SLACK_DETAILS` | variable | What goes in the Slack thread: `both` (default), `thread` or `file` |
+
 ## Current actions
 
 | Action | What it does |
