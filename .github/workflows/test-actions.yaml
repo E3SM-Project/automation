@@ -1,0 +1,31 @@
+name: Test actions
+
+# Smoke tests for the reusable actions in actions/. Each action runs for real
+# on a runner (via a local `uses: ./actions/<name>`), so a broken action.yml or
+# a failing step is caught before anyone pins a tag to it.
+#
+# To add a new action: copy the show-trigger job below, point `uses:` at the new
+# directory, and add whatever assertions make sense for that action.
+
+on:
+  pull_request:
+    paths:
+      - 'actions/**'
+      - '.github/workflows/test-actions.yaml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  show-trigger:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the action
+        uses: ./actions/show-trigger
+      - name: Check the job summary was written
+        run: |
+          grep -q "Workflow trigger" "$GITHUB_STEP_SUMMARY"
+          grep -q "Event" "$GITHUB_STEP_SUMMARY"

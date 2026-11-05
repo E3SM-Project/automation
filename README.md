@@ -61,5 +61,6 @@ Settings → Actions → General → Access.
 
 - New bot/scheduled task: add a workflow under `.github/workflows/`, with any
   logic that is more than a few lines in `scripts/` (and a test in `tests/`).
-- New shared step: add `actions/<name>/action.yml`.
+- New shared step: add `actions/<name>/action.yml`, and add a job for it in
+  `.github/workflows/test-actions.yaml` (copy the `show-trigger` one).
 - Keep secrets in repository/organization secrets, never in the repo.
