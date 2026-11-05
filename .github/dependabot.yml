@@ -1,0 +1,17 @@
+version: 2
+
+updates:
+  # Keep the actions used by our workflows and by the composite actions in
+  # actions/ up to date. Dependabot only scans action.yml files in the
+  # directories listed here, hence the glob.
+  - package-ecosystem: "github-actions"
+    directories:
+      - "/"
+      - "/actions/*"
+    schedule:
+      interval: "weekly"
+    groups:
+      # One PR per week with all the bumps, instead of one per action
+      github-actions:
+        patterns:
+          - "*"

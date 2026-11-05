@@ -1,0 +1,6 @@
+# Conservative lint config: pyflakes + syntax/import errors (ruff defaults).
+# (Explicit so CI doesn't depend on anyone's global ruff settings.)
+line-length = 120
+
+[lint]
+select = ["E4", "E9", "F"]

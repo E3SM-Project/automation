@@ -64,3 +64,10 @@ Settings → Actions → General → Access.
 - New shared step: add `actions/<name>/action.yml`, and add a job for it in
   `.github/workflows/test-actions.yaml` (copy the `show-trigger` one).
 - Keep secrets in repository/organization secrets, never in the repo.
+
+## CI
+
+- `lint.yaml`: `actionlint` and schema validation for workflows and `action.yml`
+  files, `ruff` and the unit tests for `scripts/`. Runs on every PR and on `main`.
+- Reusable actions also get a smoke test in `test-actions.yaml` (added together
+  with the first action).
