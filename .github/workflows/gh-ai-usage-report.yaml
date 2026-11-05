@@ -23,6 +23,10 @@ permissions:
 
 jobs:
   report-usage:
+    # Dependabot's PR runs can't read this repo's Actions secrets (they get a
+    # separate set of Dependabot secrets), so the fetch would fail on the empty
+    # APP_ID. Skip only that case: schedule and manual runs must never be skipped.
+    if: ${{ !(github.event_name == 'pull_request' && github.actor == 'dependabot[bot]') }}
     runs-on: ubuntu-latest
     env:
       ORG_NAME: ${{ github.repository_owner }}
