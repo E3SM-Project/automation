@@ -8,7 +8,7 @@ workflow files (Nvidia via `nvidia-smi`, AMD via `rocminfo`).
 steps:
   - name: Detect GPU
     id: gpu
-    uses: E3SM-Project/automation/actions/gpu-arch@v1
+    uses: E3SM-Project/automation/gpu-arch@v1
   - name: Configure
     run: cmake ... -D"Kokkos_ARCH_${{ steps.gpu.outputs.kokkos-arch }}=ON"
 ```
@@ -36,12 +36,16 @@ steps:
 | Nvidia | H100 (`HOPPER90`), A100 (`AMPERE80`), V100 (`VOLTA70`) |
 | AMD | `gfx942` (`AMD_GFX942`), `gfx90a` (`AMD_GFX90A`), `gfx908` (`AMD_GFX908`) |
 
-To support a new GPU, add a line to the table in `action.yml` and a stub case
-under `tests/stubs/` plus its matrix entry in `.github/workflows/test-actions.yaml`.
+To support a new GPU, add a line to the table in `action.yml` and a matching row to
+the `gpu-arch` matrix in `.github/workflows/test-actions.yaml`.
 
 ## Tests
 
-GitHub-hosted runners have no GPU, so CI puts stub `nvidia-smi`/`rocminfo`
-scripts (`tests/stubs/<case>/`) on `PATH` and checks the outputs, including the
-failure cases. This checks the mapping logic, not the real output format of the
-tools on your GPU machines: the first real use there is the real test.
+GitHub-hosted runners have no GPU, so CI fakes the tools: `tests/fake-gpu-tool` is
+copied to `nvidia-smi` or `rocminfo` on `PATH`, printing the GPU of each matrix row
+(the `rocminfo` output has the same shape as the real one: a CPU agent first, then
+the GPU), and the workflow checks the outputs, including the failure cases
+(unsupported GPU, tool exits non-zero, no tool).
+
+This checks the mapping logic, not the real output format of the tools on your GPU
+machines: the first real use there is the real test.

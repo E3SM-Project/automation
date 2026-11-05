@@ -1,0 +1,25 @@
+#!/bin/sh
+# Fake nvidia-smi / rocminfo for CI (there are no GPUs on hosted runners).
+# Copy it to a directory on PATH under the name of the tool to fake, next to two
+# files: output.txt (the GPU name, or gfx target; one line per GPU for nvidia)
+# and rc (exit code, 0 to succeed). See .github/workflows/test-actions.yaml.
+d=$(dirname "$0")
+out=$(cat "$d/output.txt")
+rc=$(cat "$d/rc")
+name=$(basename "$0")
+
+if [ "$rc" != 0 ]; then
+  echo "$name has failed" >&2
+  exit "$rc"
+fi
+
+case "$name" in
+  rocminfo)
+    # Same shape as the real thing: a CPU agent first (no gfx target), then the GPU
+    printf 'ROCk module is loaded\nAgent 1\n  Name:         AMD EPYC 7763 64-Core Processor\n  Device Type:  CPU\nAgent 2\n  Name:         %s\n  Device Type:  GPU\n  ISA Info:\n    ISA 1\n      Name:       amdgcn-amd-amdhsa--%s:sramecc+:xnack-\n' "$out" "$out"
+    ;;
+  *)
+    # nvidia-smi --query-gpu=name --format=csv,noheader: one GPU name per line
+    printf '%s\n' "$out"
+    ;;
+esac

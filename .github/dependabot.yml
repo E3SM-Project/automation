@@ -1,13 +1,14 @@
 version: 2
 
 updates:
-  # Keep the actions used by our workflows and by the composite actions in
-  # actions/ up to date. Dependabot only scans action.yml files in the
-  # directories listed here, hence the glob.
+  # Keep the actions used by our workflows and by our composite actions up to
+  # date. Dependabot only scans action.yml files in the directories listed here,
+  # so add each new action's directory to the list.
   - package-ecosystem: "github-actions"
     directories:
       - "/"
-      - "/actions/*"
+      - "/show-trigger"
+      - "/gpu-arch"
     schedule:
       interval: "weekly"
     groups:
