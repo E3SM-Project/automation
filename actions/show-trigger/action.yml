@@ -1,0 +1,105 @@
+name: 'Show trigger'
+description: |
+  Prints what triggered this workflow run (event, action, actor, ref/sha, and
+  event-specific details), and mirrors it in the job summary.
+  Only logs: no inputs, no API calls, and it never fails the job.
+
+outputs:
+  collected:
+    description: "'true' if all the info was collected and printed, 'false' if an error was swallowed"
+    value: ${{ steps.show.outputs.collected }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Print trigger info
+      id: show
+      uses: actions/github-script@v9
+      with:
+        script: |
+          // All values stay in JS (never interpolated into a shell), so
+          // attacker-controlled text (PR titles, comments) is safe to print.
+          // Still, truncate it and collapse newlines to keep logs readable.
+          const clip = (s, n = 200) => {
+            s = String(s ?? '').replace(/\s+/g, ' ').trim();
+            return s.length > n ? s.slice(0, n) + '…' : s;
+          };
+
+          try {
+            const p = context.payload;
+            const ev = context.eventName;
+            const repo = `${context.repo.owner}/${context.repo.repo}`;
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${repo}/actions/runs/${context.runId}`;
+            const attempt = process.env.GITHUB_RUN_ATTEMPT || '1';
+
+            // Event action (what happened to the event's subject)
+            let action = p.action || 'N/A';
+            if (ev === 'pull_request_review') action = p.review?.state || action;
+            else if (ev === 'workflow_dispatch') action = 'manual trigger';
+            else if (ev === 'schedule') action = 'scheduled trigger';
+
+            const rows = [];  // [label, value]
+            rows.push(['Event', ev]);
+            rows.push(['Event action', action]);
+            rows.push(['Actor', context.actor || 'unknown']);
+            const trig = process.env.GITHUB_TRIGGERING_ACTOR;
+            if (trig && trig !== context.actor) rows.push(['Triggering actor', trig]);
+            rows.push(['Repository', repo]);
+            rows.push(['Ref', context.ref]);
+            rows.push(['SHA', context.sha]);
+            rows.push(['Run', `${runUrl} (attempt ${attempt})`]);
+            rows.push(['Runner', `${process.env.RUNNER_NAME || '?'} (${process.env.RUNNER_OS || '?'}/${process.env.RUNNER_ARCH || '?'})`]);
+
+            // Event-specific details
+            if (p.pull_request) {
+              const pr = p.pull_request;
+              rows.push(['PR', `#${pr.number} ${clip(pr.title)}`]);
+              rows.push(['PR URL', pr.html_url]);
+              rows.push(['PR branches', `${pr.head?.label} → ${pr.base?.label}`]);
+              rows.push(['PR head SHA', pr.head?.sha]);
+              rows.push(['From fork', String(pr.head?.repo?.full_name !== pr.base?.repo?.full_name)]);
+              if (pr.draft !== undefined) rows.push(['Draft', String(pr.draft)]);
+            }
+            if (ev === 'push') {
+              rows.push(['Before → after', `${(p.before || '').slice(0, 10)} → ${(p.after || '').slice(0, 10)}`]);
+              rows.push(['Commits', String(p.commits?.length ?? 'N/A')]);
+              if (p.forced) rows.push(['Forced push', 'true']);
+            }
+            if (ev === 'schedule') {
+              rows.push(['Cron', p.schedule || 'N/A']);
+            }
+            if (ev === 'workflow_dispatch') {
+              const inputs = p.inputs || {};
+              const keys = Object.keys(inputs);
+              rows.push(['Inputs', keys.length ? keys.map(k => `${k}=${clip(inputs[k], 80)}`).join(', ') : '(none)']);
+            }
+            if (ev === 'workflow_run' && p.workflow_run) {
+              const wr = p.workflow_run;
+              rows.push(['Upstream workflow', `${wr.name} (${wr.conclusion || wr.status})`]);
+              rows.push(['Upstream run', wr.html_url]);
+            }
+            if (ev === 'issue_comment' || ev === 'pull_request_review_comment') {
+              const issue = p.issue || p.pull_request;
+              if (issue) rows.push(['On', `#${issue.number} ${clip(issue.title)}`]);
+              rows.push(['Comment by', p.comment?.user?.login || 'unknown']);
+              rows.push(['Comment', clip(p.comment?.body, 120)]);
+            }
+
+            // Log
+            console.log(`The job was triggered by a ${ev} event.`);
+            for (const [k, v] of rows) console.log(`  - ${k}: ${v}`);
+
+            // Job summary (table cells: escape pipes)
+            const esc = s => String(s ?? '').replace(/\|/g, '\\|');
+            await core.summary
+              .addHeading('Workflow trigger', 3)
+              // Leading blank line: a table right after the HTML <h3> would otherwise be
+              // swallowed by the HTML block and shown as raw text.
+              .addRaw('\n| Field | Value |\n| --- | --- |\n' + rows.map(([k, v]) => `| ${esc(k)} | ${esc(v)} |`).join('\n') + '\n', true)
+              .write();
+            core.setOutput('collected', 'true');
+          } catch (e) {
+            // This action is informational: never fail the workflow because of it.
+            core.warning(`show-trigger could not collect all info: ${e.message}`);
+            core.setOutput('collected', 'false');
+          }

@@ -30,6 +30,12 @@ tests/               # tests for the scripts
 
 Both can also be run manually from the Actions tab (`workflow_dispatch`).
 
+## Current actions
+
+| Action | What it does |
+| --- | --- |
+| `actions/show-trigger` | Prints the event, actor, ref/SHA, and event-specific details (PR, push, inputs, ...) that triggered the run, also as a job summary |
+
 ## Using reusable actions from other repos
 
 Reference an action by its full path, including the owner, the `actions/`
@@ -55,5 +61,6 @@ Settings → Actions → General → Access.
 
 - New bot/scheduled task: add a workflow under `.github/workflows/`, with any
   logic that is more than a few lines in `scripts/` (and a test in `tests/`).
-- New shared step: add `actions/<name>/action.yml`.
+- New shared step: add `actions/<name>/action.yml`, and add a job for it in
+  `.github/workflows/test-actions.yaml` (copy the `show-trigger` one).
 - Keep secrets in repository/organization secrets, never in the repo.
