@@ -5,8 +5,19 @@ on:
     # 18:00 UTC is 10 AM during daylight time (PDT) and 11 AM during standard
     # time (PST), allowing most overnight CI results to reach CDash first.
     - cron: "0 18 * * 1-5"
+    # Standalone/unit tests use an independent report and run.
+    - cron: "30 18 * * 1-5"
   workflow_dispatch:
     inputs:
+      profile:
+        description: "Which EAMxx report to run"
+        type: choice
+        options:
+          - all
+          - eamxx-cime
+          - eamxx-unit
+        default: all
+        required: true
       date:
         description: "CDash testing day (YYYY-MM-DD); blank = current"
         required: false
@@ -27,8 +38,26 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+      - name: Select report profile
+        id: profile
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+          INPUT_PROFILE: ${{ inputs.profile }}
+        run: |
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            case "$SCHEDULE" in
+              "0 18 * * 1-5") profile=eamxx-cime ;;
+              "30 18 * * 1-5") profile=eamxx-unit ;;
+              *) echo "Unexpected CDash report schedule: $SCHEDULE" >&2; exit 1 ;;
+            esac
+          else
+            profile="${INPUT_PROFILE:-all}"
+          fi
+          echo "profile=$profile" >> "$GITHUB_OUTPUT"
       - name: Build and post report
         env:
+          REPORT_PROFILE: ${{ steps.profile.outputs.profile }}
           INPUT_DATE: ${{ inputs.date }}
           INPUT_DRY_RUN: ${{ inputs.dry_run }}
           # Preferred: a Slack app's bot token (summary in the channel, details
@@ -41,6 +70,7 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_EAMXX_CDASH_WEBHOOK_URL }}
         run: |
           args=()
+          args+=(--profile "$REPORT_PROFILE")
           [ -n "$INPUT_DATE" ] && args+=(--date "$INPUT_DATE")
           [ "$INPUT_DRY_RUN" = "true" ] && args+=(--dry-run)
           python .github/scripts/cdash_eamxx_report.py "${args[@]}"
@@ -49,7 +79,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: cdash-eamxx-report
+          name: cdash-eamxx-report-${{ steps.profile.outputs.profile }}
           path: cdash_report/
           retention-days: 30
           if-no-files-found: warn
@@ -61,11 +91,12 @@ jobs:
         if: ${{ failure() && inputs.dry_run != true }}
         continue-on-error: true
         env:
+          REPORT_PROFILE: ${{ steps.profile.outputs.profile }}
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_EAMXX_CDASH_WEBHOOK_URL }}
         run: |
-          text=":red_circle: CDash EAMxx daily report workflow failed - see ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          text="CDash EAMxx ${REPORT_PROFILE} report workflow failed - see ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           if [ -n "$SLACK_BOT_TOKEN" ] && [ -n "$SLACK_CHANNEL_ID" ]; then
             jq -n --arg c "$SLACK_CHANNEL_ID" --arg t "$text" '{channel: $c, text: $t}' |
               curl -sS -X POST https://slack.com/api/chat.postMessage \

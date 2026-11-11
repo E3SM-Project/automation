@@ -2,9 +2,12 @@
 failures from logs, and formatting for Slack. The end-to-end flow is covered in
 test_cdash_eamxx_report.py."""
 import importlib.util
+import io
 import pathlib
+import tarfile
 import unittest
 from collections import Counter
+from unittest.mock import patch
 
 SCRIPT = pathlib.Path(__file__).parents[1] / "cdash_eamxx_report.py"
 SPEC = importlib.util.spec_from_file_location("cdash_eamxx_report", SCRIPT)
@@ -33,6 +36,20 @@ class ClassifyTests(unittest.TestCase):
     def test_anything_else_is_a_run_failure(self):
         self.assertEqual(REPORT.classify(make_test(phase="RUN"), "unrelated"), "FAIL")
         self.assertEqual(REPORT.classify(make_test(), ""), "FAIL")
+
+    def test_diff_diagnostics_are_concise(self):
+        log = "\n".join([
+            "master: FIELDLIST field lists differ (otherwise bit-for-bit)",
+            "master: ERROR BFAIL baseline directory /some/private/path does not exist",
+        ])
+        self.assertEqual(REPORT.diff_diagnostics(log), [
+            "field lists differ (otherwise bit-for-bit)",
+            "baseline directory is missing",
+        ])
+        self.assertNotIn("private", " ".join(REPORT.diff_diagnostics(log)))
+
+    def test_unrelated_output_has_no_diff_diagnostics(self):
+        self.assertEqual(REPORT.diff_diagnostics("Completed (DIFF)"), [])
 
 
 class TextHelperTests(unittest.TestCase):
@@ -66,12 +83,79 @@ class TextHelperTests(unittest.TestCase):
             self.assertIn(label, out)
         self.assertNotIn("not run", out)  # hidden while zero
         zero["NOTRUN"] = 2
-        self.assertIn("2 not run", REPORT.counts_str(zero))
+        self.assertIn("not run 2", REPORT.counts_str(zero))
 
     def test_posted_note_says_how_much_reached_slack(self):
         self.assertEqual(REPORT.posted_note(1), ". Nothing was posted.")
         self.assertEqual(REPORT.posted_note(2), ". Message 1 was posted.")
         self.assertEqual(REPORT.posted_note(5), ". Messages 1-4 were posted.")
+
+
+class TarballTests(unittest.TestCase):
+    def test_streaming_tarball_still_reads_wanted_log_with_short_receives(self):
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode="w:gz") as tar:
+            data = b"ERROR: RUN FAIL\n"
+            member = tarfile.TarInfo("test-one_CASEDIR_logs/TestStatus.log")
+            member.size = len(data)
+            tar.addfile(member, io.BytesIO(data))
+
+        class Response:
+            def __init__(self, data):
+                self.data = io.BytesIO(data)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return None
+
+            def read1(self, size):
+                return self.data.read(min(size, 7))
+
+            def read(self, size):
+                raise AssertionError("a full blocking read would defeat the deadline")
+
+        files = {"build": {"files": {"edges": [{"node": {
+            "id": "file-1", "name": "logs.tar.gz", "size": len(archive.getvalue()),
+        }}]}}}
+        with patch.object(REPORT, "gql", return_value=files), \
+             patch.object(REPORT.urllib.request, "urlopen", return_value=Response(archive.getvalue())) as urlopen:
+            logs = REPORT.build_logs("build-1", {"test-one"})
+
+        self.assertEqual(logs["test-one"]["CASEDIR"], [("TestStatus.log", "ERROR: RUN FAIL\n")])
+        self.assertEqual(urlopen.call_args.kwargs["timeout"], REPORT.TARBALL_IDLE_TIMEOUT_SECONDS)
+
+    def test_tarball_deadline_stops_a_slow_trickle(self):
+        class Response:
+            def read1(self, size):
+                return b"x"
+
+        reader = REPORT.TimedTarballReader(Response(), deadline=60)
+        with patch.object(REPORT.time, "monotonic", side_effect=[59, 61]):
+            with self.assertRaisesRegex(TimeoutError, "read limit"):
+                reader.read(1024)
+
+    def test_tarball_timeout_keeps_cdash_output_for_failure_triage(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return None
+
+            def read1(self, size):
+                raise TimeoutError("read timed out")
+
+        files = {"build": {"files": {"edges": [{"node": {
+            "id": "file-1", "name": "logs.tar.gz", "size": 100,
+        }}]}}}
+        test = {"name": "test-one", "bucket": "FAIL", "output": "Assertion failed", "phase": None}
+        with patch.object(REPORT, "gql", return_value=files), \
+             patch.object(REPORT.urllib.request, "urlopen", return_value=Response()):
+            REPORT.triage_build_tests("build-1", [test])
+        self.assertIn("Assertion failed", test["likely_cause"])
+        self.assertEqual(test["evidence"][0]["file"], "CDash test output")
 
 
 class LogAnalysisTests(unittest.TestCase):
