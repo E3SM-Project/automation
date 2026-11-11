@@ -79,6 +79,52 @@ class FormattingTests(unittest.TestCase):
         self.assertIn("failure-name", thread)
         self.assertNotIn("Started:", thread)
 
+    def test_shared_diff_diagnostics_are_summarized_for_suite(self):
+        diagnostics = [
+            "field lists differ (otherwise bit-for-bit)",
+            "baseline directory is missing",
+        ]
+        diffs = [
+            {"id": "test-1", "name": "diff-one", "bucket": "DIFF", "bless": None,
+             "diff_diagnostics": diagnostics},
+            {"id": "test-2", "name": "diff-two", "bucket": "DIFF", "bless": None,
+             "diff_diagnostics": diagnostics},
+        ]
+        rep = {"date": "2026-11-04", "coverage": [], "groups": [{
+            "name": "group", "mode": "all", "missing": False, "excluded_old": 0,
+            "builds": [{"id": "1", "site": "site", "name": "suite", "tests": diffs,
+                        "counts": Counter({"DIFF": 2}), "orphan_build_errors": 0,
+                        "commit": None}],
+        }]}
+
+        report = REPORT.format_report(rep)
+        self.assertIn("All DIFFs report: field lists differ (otherwise bit-for-bit).", report)
+        self.assertIn("All DIFFs report: baseline directory is missing.", report)
+        self.assertIn("diff-one", report)
+        self.assertIn("diff-two", report)
+        self.assertNotIn("/some/private/path", report)
+
+    def test_mixed_diff_diagnostics_stay_with_their_tests(self):
+        diffs = [
+            {"id": "test-1", "name": "fieldlist-diff", "bucket": "DIFF", "bless": None,
+             "diff_diagnostics": ["field lists differ (otherwise bit-for-bit)"]},
+            {"id": "test-2", "name": "missing-baseline-diff", "bucket": "DIFF", "bless": None,
+             "diff_diagnostics": ["baseline directory is missing"]},
+        ]
+        rep = {"date": "2026-11-04", "coverage": [], "groups": [{
+            "name": "group", "mode": "all", "missing": False, "excluded_old": 0,
+            "builds": [{"id": "1", "site": "site", "name": "suite", "tests": diffs,
+                        "counts": Counter({"DIFF": 2}), "orphan_build_errors": 0,
+                        "commit": None}],
+        }]}
+
+        report = REPORT.format_report(rep)
+        self.assertIn("fieldlist-diff", report)
+        self.assertIn("field lists differ (otherwise bit-for-bit)", report)
+        self.assertIn("missing-baseline-diff", report)
+        self.assertIn("baseline directory is missing", report)
+        self.assertNotIn("All DIFFs report:", report)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -83,6 +83,12 @@ MAX_SUITE_AGE_HOURS = 18
 MAX_SUITE_AGE_SECONDS = MAX_SUITE_AGE_HOURS * 60 * 60
 
 BLESS_RE = re.compile(r"Most recent bless:\s*sha:(\S+)\s+date:(\S+)")
+FIELDLIST_RE = re.compile(r"master:\s*FIELDLIST field lists differ \(otherwise bit-for-bit\)")
+BFAIL_BASELINE_RE = re.compile(r"master:\s*ERROR BFAIL baseline directory [^\r\n]* does not exist")
+DIFF_DIAGNOSTICS = {
+    "fieldlist": "field lists differ (otherwise bit-for-bit)",
+    "missing_baseline": "baseline directory is missing",
+}
 PHASE_RE = re.compile(r"(\w+) FAILED for test")
 NOTES_COMMIT_RE = re.compile(r"^Commit\s+([0-9a-f]{7,40})\b", re.M)  # in the suite's notes.txt
 LOG_VERSION_RE = re.compile(r"e3sm model version found:\s*([0-9a-f]{7,40})\b")  # CIME test logs
@@ -219,6 +225,7 @@ def collect(date, now=None):
                     t["phase"] = m.group(1) if m else None
                     m = BLESS_RE.search(log)
                     t["bless"] = (m.group(1), m.group(2)) if m else None
+                    t["diff_diagnostics"] = diff_diagnostics(log)
                     t["baseline_exception"] = "Exception during BASELINE" in log
                     m = LOG_VERSION_RE.search(log)
                     t["model_version"] = m.group(1) if m else None
@@ -248,6 +255,16 @@ def collect(date, now=None):
             print(f"  {gname} / {b['site']} / {b['buildname']}: {len(tests)} tests", file=sys.stderr)
         report["groups"].append(group)
     return report
+
+
+def diff_diagnostics(log):
+    """Return concise, actionable DIFF details found in CDash test output."""
+    diagnostics = []
+    if FIELDLIST_RE.search(log):
+        diagnostics.append(DIFF_DIAGNOSTICS["fieldlist"])
+    if BFAIL_BASELINE_RE.search(log):
+        diagnostics.append(DIFF_DIAGNOSTICS["missing_baseline"])
+    return diagnostics
 
 
 def find_commit(build_id, tests):
@@ -881,21 +898,32 @@ def format_details(rep, evidence_note=None, slack=False):
         if diffs:
             lines.append(f"  {EMOJI['DIFF']} *DIFF ({len(diffs)})*")
             blesses = {t["bless"] for t in diffs}
-            if len(diffs) > 1 and len(blesses) == 1 and None not in blesses:
+            shared_bless = len(diffs) > 1 and len(blesses) == 1 and None not in blesses
+            shared_diagnostics = {
+                diagnostic for diagnostic in DIFF_DIAGNOSTICS.values()
+                if len(diffs) > 1 and all(diagnostic in t.get("diff_diagnostics", []) for t in diffs)
+            }
+            if shared_bless:
                 sha, date = blesses.pop()
                 lines.append(f"      _All DIFFs have the same sha and baseline date:_ "
-                              f"sha `{sha[:12]}` · blessed {display(date, slack)}")
-                lines += [f"      • {tlink(t, slack)}" for t in diffs]
-            else:
-                for t in diffs:
+                             f"sha `{sha[:12]}` · blessed {display(date, slack)}")
+            for diagnostic in (DIFF_DIAGNOSTICS.values()):
+                if diagnostic in shared_diagnostics:
+                    lines.append(f"      _All DIFFs report: {display(diagnostic, slack)}._")
+
+            for t in diffs:
+                info = []
+                if not shared_bless:
                     if t["bless"]:
-                        info = (f"sha `{t['bless'][0][:12]}` · blessed "
-                                f"{display(t['bless'][1], slack)}")
+                        info.append(f"sha `{t['bless'][0][:12]}` · blessed "
+                                    f"{display(t['bless'][1], slack)}")
                     elif t.get("baseline_exception"):
-                        info = "_baseline comparison raised an exception; no bless info in log_"
+                        info.append("_baseline comparison raised an exception; no bless info in log_")
                     else:
-                        info = "_bless info not found in log_"
-                    lines.append(f"      • {tlink(t, slack)}: {info}")
+                        info.append("_bless info not found in log_")
+                info.extend(display(diagnostic, slack) for diagnostic in t.get("diff_diagnostics", [])
+                            if diagnostic not in shared_diagnostics)
+                lines.append(f"      • {tlink(t, slack)}" + (f": {' · '.join(info)}" if info else ""))
     if any(t.get("likely_cause") for g in rep["groups"] for b in g["builds"] for t in b["tests"]):
         lines += ["", evidence_note or evidence_link()]
     return lines

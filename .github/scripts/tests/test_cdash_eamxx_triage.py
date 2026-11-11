@@ -34,6 +34,20 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(REPORT.classify(make_test(phase="RUN"), "unrelated"), "FAIL")
         self.assertEqual(REPORT.classify(make_test(), ""), "FAIL")
 
+    def test_diff_diagnostics_are_concise(self):
+        log = "\n".join([
+            "master: FIELDLIST field lists differ (otherwise bit-for-bit)",
+            "master: ERROR BFAIL baseline directory /some/private/path does not exist",
+        ])
+        self.assertEqual(REPORT.diff_diagnostics(log), [
+            "field lists differ (otherwise bit-for-bit)",
+            "baseline directory is missing",
+        ])
+        self.assertNotIn("private", " ".join(REPORT.diff_diagnostics(log)))
+
+    def test_unrelated_output_has_no_diff_diagnostics(self):
+        self.assertEqual(REPORT.diff_diagnostics("Completed (DIFF)"), [])
+
 
 class TextHelperTests(unittest.TestCase):
     def test_short_collapses_whitespace_and_truncates(self):
