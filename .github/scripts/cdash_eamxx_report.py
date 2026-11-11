@@ -25,12 +25,14 @@ crashes, time limits, memory kills, comparison and memory-leak failures. The
 log lines behind each cause go in the saved report and GitHub job summary.
 
 Usage:
-  Run .github/workflows/cdash-eamxx-report.yaml on its weekday schedule, or
-  use workflow_dispatch to select a testing date or dry run.
+  Run .github/workflows/cdash-eamxx-report.yaml on its CIME/unit weekday
+  schedules, or use workflow_dispatch to choose a profile and testing date.
+  The command-line profile defaults to "all" to preserve the combined report.
 
 Output, in this order, so a Slack problem never loses the report:
-  1. cdash_report/cdash_eamxx_report_<date>.md   readable Markdown copy (always)
-     cdash_report/slack_message.txt              exact Slack text, for pasting by hand
+  1. cdash_report/cdash_eamxx_report_<date>.md   combined report (profile=all)
+     cdash_report/cdash_eamxx_report_<profile>_<date>.md   selected profile
+     cdash_report/slack_message*.txt             exact Slack text, for pasting by hand
   2. the GitHub Actions job summary (when run in Actions) and stdout
   3. Slack, if configured. If posting fails (revoked token, bot not in the
      channel, missing permission, network), the error and what it usually means
@@ -79,7 +81,16 @@ GROUPS = {
     "E3SM_MustPass": "eamxx",
 }
 NAME_FILTER = "eamxx"
+PROFILE_ALL = "all"
+PROFILE_CIME = "eamxx-cime"
+PROFILE_UNIT = "eamxx-unit"
+PROFILES = (PROFILE_ALL, PROFILE_CIME, PROFILE_UNIT)
 REPORT_SECTIONS = (("CIME-based tests", False), ("Standalone tests", True))
+PROFILE_LABELS = {
+    PROFILE_ALL: "combined",
+    PROFILE_CIME: "CIME",
+    PROFILE_UNIT: "unit",
+}
 MAX_SUITE_AGE_HOURS = 18
 MAX_SUITE_AGE_SECONDS = MAX_SUITE_AGE_HOURS * 60 * 60
 
@@ -99,10 +110,6 @@ SLACK_CHUNK = 3500  # keep each Slack message comfortably under display limits
 BUCKETS = ["PASS", "FAIL", "BUILDFAIL", "DIFF", "NOTRUN"]
 LABEL = {"PASS": "PASS", "FAIL": "FAIL", "BUILDFAIL": "BUILD FAIL", "DIFF": "DIFF",
          "NOTRUN": "not run"}
-EMOJI = {"PASS": ":white_check_mark:", "FAIL": ":x:", "BUILDFAIL": ":hammer_and_wrench:",
-         "DIFF": ":large_orange_diamond:", "NOTRUN": ":hourglass_flowing_sand:"}
-
-
 # --------------------------------------------------------------------------- CDash
 def http_json(url, payload=None, retries=3):
     data = json.dumps(payload).encode() if payload is not None else None
@@ -173,11 +180,13 @@ def classify(t, build_error_text):
 
 
 # --------------------------------------------------------------------------- collect
-def collect(date, now=None):
+def collect(date, now=None, profile=PROFILE_ALL):
+    if profile not in PROFILES:
+        raise ValueError(f"unknown report profile: {profile}")
     url = f"{CDASH}/api/v1/index.php?project={PROJECT}" + (f"&date={date}" if date else "")
     index = http_json(url)
-    report = {"date": index.get("date"), "groups": [],
-              "coverage": collect_coverage(index)}
+    report = {"date": index.get("date"), "profile": profile, "groups": [],
+              "coverage": collect_coverage(index) if profile != PROFILE_CIME else []}
     cutoff = (time.time() if now is None else now) - MAX_SUITE_AGE_SECONDS
     by_name = {g["name"]: g for g in index.get("buildgroups", [])}
 
@@ -186,6 +195,8 @@ def collect(date, now=None):
         group = {"name": gname, "mode": mode, "builds": [], "missing": g is None,
                  "excluded_old": 0, "excluded_old_cime": 0, "excluded_old_standalone": 0}
         for b in (g or {}).get("builds", []):
+            if not suite_matches_profile(b["buildname"], profile):
+                continue
             tests = paged(TESTS_Q, b["id"], "tests")
             if mode == NAME_FILTER:
                 tests = [t for t in tests if NAME_FILTER in t["name"].lower()]
@@ -295,9 +306,8 @@ def collect_coverage(index):
         out.append(c)
     green, yellow = index.get("thresholdgreen", 70), index.get("thresholdyellow", 49)
     for c in out:
-        p = c["percentage"]
-        c["emoji"] = ":large_green_circle:" if p >= green else (
-            ":large_yellow_circle:" if p >= yellow else ":red_circle:")
+        c["thresholdgreen"] = green
+        c["thresholdyellow"] = yellow
     return out
 
 
@@ -309,6 +319,8 @@ def collect_coverage(index):
 # verdict.
 
 MAX_TARBALL_BYTES = 200 * 1024 * 1024  # skip unusually large uploads
+TARBALL_IDLE_TIMEOUT_SECONDS = 15  # one stalled network read
+TARBALL_TOTAL_SECONDS = 60  # one tarball, including connection and archive iteration
 LOG_HEAD, LOG_TAIL = 4 * 1024 * 1024, 16 * 1024 * 1024  # per-log read caps
 EVIDENCE_LINES = 12
 
@@ -350,6 +362,27 @@ def read_capped(fileobj, gz):
     return head.decode("utf-8", errors="replace")
 
 
+class TimedTarballReader:
+    """Bound both elapsed time and downloaded bytes while streaming a tarball."""
+    def __init__(self, response, deadline):
+        self.response = response
+        self.deadline = deadline
+        self.bytes_read = 0
+
+    def read(self, size):
+        if time.monotonic() >= self.deadline:
+            raise TimeoutError(f"log tarball exceeded the {TARBALL_TOTAL_SECONDS}-second read limit")
+        # read1 returns after one socket receive. A full read(size) can keep
+        # waiting indefinitely if a server sends a slow trickle of bytes.
+        chunk = self.response.read1(size)
+        self.bytes_read += len(chunk)
+        if self.bytes_read > MAX_TARBALL_BYTES:
+            raise ValueError("log tarball exceeds the download size limit")
+        if time.monotonic() >= self.deadline:
+            raise TimeoutError(f"log tarball exceeded the {TARBALL_TOTAL_SECONDS}-second read limit")
+        return chunk
+
+
 def build_logs(build_id, wanted_tests):
     """Download a suite's log tarball(s) and return {test: {kind: [(file, text)]}}
     for the given test names. Returns {} if the suite uploaded no logs."""
@@ -361,22 +394,26 @@ def build_logs(build_id, wanted_tests):
             continue
         req = urllib.request.Request(f"{CDASH}/builds/{build_id}/files/{f['id']}",
                                      headers={"User-Agent": "e3sm-cdash-eamxx-bot"})
-        with urllib.request.urlopen(req, timeout=600) as r:
-            with tarfile.open(fileobj=r, mode="r|gz") as tar:
-                for m in tar:
-                    mt = TAR_TEST_RE.search("/" + m.name)
-                    if not m.isfile() or not mt or mt.group(1) not in wanted_tests:
-                        continue
-                    test, kind, rel = mt.groups()
-                    base = rel.split("/")[-1]
-                    if kind == "RUNDIR" and not re.match(r"(e3sm|atm|cpl)\.log\.", base):
-                        continue
-                    if kind == "EXEROOT" and ".bldlog." not in base:
-                        continue
-                    if kind == "CASEDIR" and base != "TestStatus.log":
-                        continue
-                    text = read_capped(tar.extractfile(m), base.endswith(".gz"))
-                    out.setdefault(test, {}).setdefault(kind, []).append((base, text))
+        deadline = time.monotonic() + TARBALL_TOTAL_SECONDS
+        try:
+            with urllib.request.urlopen(req, timeout=TARBALL_IDLE_TIMEOUT_SECONDS) as r:
+                with tarfile.open(fileobj=TimedTarballReader(r, deadline), mode="r|gz") as tar:
+                    for m in tar:
+                        mt = TAR_TEST_RE.search("/" + m.name)
+                        if not m.isfile() or not mt or mt.group(1) not in wanted_tests:
+                            continue
+                        test, kind, rel = mt.groups()
+                        base = rel.split("/")[-1]
+                        if kind == "RUNDIR" and not re.match(r"(e3sm|atm|cpl)\.log\.", base):
+                            continue
+                        if kind == "EXEROOT" and ".bldlog." not in base:
+                            continue
+                        if kind == "CASEDIR" and base != "TestStatus.log":
+                            continue
+                        text = read_capped(tar.extractfile(m), base.endswith(".gz"))
+                        out.setdefault(test, {}).setdefault(kind, []).append((base, text))
+        except TimeoutError as e:
+            print(f"  skipped slow log tarball for build {build_id}: {e}", file=sys.stderr)
     def newest_first(ft):
         m = LID_RE.search(ft[0])
         return m.group(1) if m else ""
@@ -740,7 +777,8 @@ def tlink(t, slack=False):
 
 
 def counts_str(c, show_zero=("PASS", "FAIL", "BUILDFAIL", "DIFF")):
-    parts = [f"{EMOJI[k]} {c[k]:,} {LABEL[k]}" for k in BUCKETS if c[k] or k in show_zero]
+    summary_order = ("FAIL", "BUILDFAIL", "DIFF", "PASS", "NOTRUN")
+    parts = [f"{LABEL[k]} {c[k]:,}" for k in summary_order if c[k] or k in show_zero]
     return " · ".join(parts)
 
 
@@ -762,9 +800,9 @@ def format_failures(ts, slack=False):
 
 
 def diff_signature(test):
-    """The baseline state and diagnostics that make two DIFFs equivalent."""
+    """Group blessed DIFFs by SHA, ignoring sequential bless timestamps."""
     if test.get("bless"):
-        baseline = ("bless", *test["bless"])
+        baseline = ("bless", test["bless"][0])
     elif test.get("baseline_exception"):
         baseline = ("exception",)
     else:
@@ -773,19 +811,27 @@ def diff_signature(test):
 
 
 def format_diff_tallies(diffs, slack=False):
-    """Concise DIFF tallies, grouped by their baseline state and diagnostics."""
-    tallies, first_seen = Counter(), {}
+    """Group DIFFs by baseline SHA and diagnostics; display distinct bless days."""
+    tallies, first_seen, bless_days = Counter(), {}, {}
     for index, test in enumerate(diffs):
         signature = diff_signature(test)
         tallies[signature] += 1
         first_seen.setdefault(signature, index)
+        if test.get("bless"):
+            match = re.match(r"\d{4}-\d{2}-\d{2}", str(test["bless"][1]))
+            bless_days.setdefault(signature, set()).add(match.group() if match else None)
 
     lines = []
     for signature, count in sorted(tallies.items(), key=lambda item: (-item[1], first_seen[item[0]])):
         baseline, diagnostics = signature
         if baseline[0] == "bless":
-            _, sha, date = baseline
-            info = f"sha `{sha[:12]}` · blessed {display(date, slack)}"
+            _, sha = baseline
+            info = f"sha `{sha[:12]}`"
+            days = bless_days[signature]
+            if days - {None}:
+                info += f" · blessed {', '.join(sorted(days - {None}))}"
+            if None in days:
+                info += " · bless date unavailable"
         elif baseline[0] == "exception":
             info = "_baseline comparison raised an exception; no bless info in log_"
         else:
@@ -845,17 +891,37 @@ def format_coverage(cov, slack=False):
             d = c["percentagediff"]
             change = f" ({'+' if d >= 0 else ''}{d:.2f}% vs previous)"
         total = c["loctested"] + c["locuntested"]
+        status = coverage_status(c)
         lines.append(f"    • <{CDASH}/builds/{c['buildid']}/coverage|{display(c['site'], slack)} / "
                      f"{display(c['buildname'], slack)}>: "
-                     f"{c['emoji']} *{c['percentage']:.2f}%*{change} · "
+                     f"*{c['percentage']:.2f}%* ({status}){change} · "
                      f"{c['loctested']:,} of {total:,} lines covered")
     return lines
+
+
+def coverage_status(coverage):
+    """Describe CDash coverage thresholds without relying on color or icons."""
+    percentage = coverage["percentage"]
+    green = coverage.get("thresholdgreen", 70)
+    yellow = coverage.get("thresholdyellow", 49)
+    if percentage >= green:
+        return f"meets target of {green:g}%"
+    if percentage >= yellow:
+        return f"warning band above {yellow:g}%"
+    return f"below minimum of {yellow:g}%"
 
 
 def is_standalone_suite(name):
     """Whether a CDash suite contains standalone/unit tests rather than CIME tests."""
     name = name.lower()
     return "unit_tests" in name or "scripts_tests" in name
+
+
+def suite_matches_profile(name, profile):
+    """Whether a build suite belongs in the requested report profile."""
+    if profile == PROFILE_ALL:
+        return True
+    return is_standalone_suite(name) == (profile == PROFILE_UNIT)
 
 
 def section_groups(rep, standalone):
@@ -874,6 +940,18 @@ def section_totals(rep, standalone):
             total += build["counts"]
             nsuites += 1
     return total, nsuites
+
+
+def report_sections(rep):
+    """Sections rendered for a combined or profile-specific report."""
+    profile = rep.get("profile", PROFILE_ALL)
+    if profile == PROFILE_ALL:
+        return REPORT_SECTIONS
+    if profile == PROFILE_CIME:
+        return (REPORT_SECTIONS[0],)
+    if profile == PROFILE_UNIT:
+        return (REPORT_SECTIONS[1],)
+    raise ValueError(f"unknown report profile: {profile}")
 
 
 def report_totals(rep):
@@ -898,7 +976,10 @@ def suite_started_at(b):
 
 def format_header(rep, slack=False):
     total, nsuites = report_totals(rep)
-    return [f"*E3SM CDash EAMxx report: testing day {display(rep['date'], slack)}*",
+    profile = rep.get("profile", PROFILE_ALL)
+    title = "E3SM CDash EAMxx report" if profile == PROFILE_ALL else (
+        f"E3SM CDash EAMxx {PROFILE_LABELS[profile]} report")
+    return [f"*{title}: testing day {display(rep['date'], slack)}*",
             f"<{CDASH}/index.php?project={PROJECT}&date={rep['date']}|Dashboard> · "
              f"{nsuites} suites · {sum(total.values()):,} tests · {counts_str(total)}"]
 
@@ -906,13 +987,18 @@ def format_header(rep, slack=False):
 def format_section_header(rep, standalone, slack=False):
     total, nsuites = section_totals(rep, standalone)
     label = "Standalone tests" if standalone else "CIME-based tests"
-    return [f"*{label}* · {nsuites} suites · {sum(total.values()):,} tests · {counts_str(total)}"]
+    return [f"*{label}* · {nsuites} suites · {sum(total.values()):,} tests · "
+            f"{counts_str(total)}"]
 
 
 def format_group_summary(rep, standalone, slack=False):
     """One aggregate line per test group, without listing individual suites."""
     lines = []
-    for g, builds in section_groups(rep, standalone):
+    groups = list(section_groups(rep, standalone))
+    if not any(builds for _, builds in groups):
+        if not any(g["missing"] for g, _ in groups):
+            return ["• _No suites matched this report profile._"]
+    for g, builds in groups:
         if g["missing"]:
             lines.append(f"• *{display(g['name'], slack)}*: _group not present on the dashboard today_")
             continue
@@ -954,7 +1040,7 @@ def format_details(rep, evidence_note=None, slack=False, standalone=None):
         groups = list(section_groups(rep, standalone))
     problems = [(g, b) for g, builds in groups for b in builds if has_problems(b)]
     lines.append("*Details: FAILs, BUILD FAILs and DIFFs*" if problems
-                 else "*No FAILs, BUILD FAILs or DIFFs* :tada:")
+                 else "*No FAILs, BUILD FAILs or DIFFs*")
     for g, b in problems:
         lines.append("")
         lines.append(f"*{display(g['name'], slack)}* · {blink(b, slack)}")
@@ -969,14 +1055,14 @@ def format_details(rep, evidence_note=None, slack=False, standalone=None):
         for bucket in ("BUILDFAIL", "FAIL"):
             ts = [t for t in b["tests"] if t["bucket"] == bucket]
             if ts:
-                lines.append(f"  {EMOJI[bucket]} *{LABEL[bucket]} ({len(ts)})*")
+                lines.append(f"  *{LABEL[bucket]} ({len(ts)})*")
                 lines += format_failures(ts, slack)
         if b["orphan_build_errors"]:
-            lines.append(f"  {EMOJI['BUILDFAIL']} *{b['orphan_build_errors']} build errors not tied to a test*: "
+            lines.append(f"  *{b['orphan_build_errors']} build errors not tied to a test*: "
                          f"see <{CDASH}/builds/{b['id']}/build|build errors>")
         diffs = [t for t in b["tests"] if t["bucket"] == "DIFF"]
         if diffs:
-            lines.append(f"  {EMOJI['DIFF']} *DIFF ({len(diffs)})*")
+            lines.append(f"  *DIFF ({len(diffs)})*")
             lines += format_diff_tallies(diffs, slack)
     if any(t.get("likely_cause") for _, builds in groups for b in builds for t in b["tests"]):
         lines += ["", evidence_note or evidence_link()]
@@ -984,9 +1070,9 @@ def format_details(rep, evidence_note=None, slack=False, standalone=None):
 
 
 def format_report(rep, slack=False):
-    """Compact report with separate CIME-based and standalone test sections."""
+    """Compact report for all tests or one selected profile."""
     lines = format_header(rep, slack) + [""]
-    for label, standalone in REPORT_SECTIONS:
+    for label, standalone in report_sections(rep):
         lines += format_section_header(rep, standalone, slack)
         lines += format_group_summary(rep, standalone, slack)
         lines += [format_excluded_old(rep, standalone)]
@@ -997,28 +1083,29 @@ def format_report(rep, slack=False):
 
 
 def format_markdown_report(rep):
-    """Markdown report with separate tables for CIME and standalone tests."""
+    """Markdown report with tables for all tests or one selected profile."""
     total, nsuites = report_totals(rep)
     lines = [
-        f"## E3SM CDash EAMxx report: testing day {rep['date']}",
+        f"## {format_header(rep)[0].strip('*')}",
         f"[Dashboard]({CDASH}/index.php?project={PROJECT}&date={rep['date']}) · "
         f"{nsuites} suites · {sum(total.values()):,} tests",
         "",
     ]
-    for label, standalone in REPORT_SECTIONS:
+    for label, standalone in report_sections(rep):
         total, nsuites = section_totals(rep, standalone)
-        lines += [f"### {label}", "", "| Group | Suites | PASS | FAIL | BUILD FAIL | DIFF | Not run |",
+        lines += [f"### {label}", "", "| Group | Suites | FAIL | BUILD FAIL | DIFF | PASS | Not run |",
                   "|---|---:|---:|---:|---:|---:|---:|"]
         for g, builds in section_groups(rep, standalone):
             if g["missing"]:
                 lines.append(f"| {g['name']} | — | — | — | — | — | — |")
                 continue
             counts = sum((b["counts"] for b in builds), Counter())
-            lines.append(f"| {g['name']} | {len(builds)} | {counts['PASS']:,} | "
-                         f"{counts['FAIL']:,} | {counts['BUILDFAIL']:,} | {counts['DIFF']:,} | "
+            lines.append(f"| {g['name']} | {len(builds)} | {counts['FAIL']:,} | "
+                         f"{counts['BUILDFAIL']:,} | {counts['DIFF']:,} | {counts['PASS']:,} | "
                          f"{counts['NOTRUN']:,} |")
-        lines.append(f"| **Total** | **{nsuites}** | **{total['PASS']:,}** | **{total['FAIL']:,}** | "
-                     f"**{total['BUILDFAIL']:,}** | **{total['DIFF']:,}** | **{total['NOTRUN']:,}** |")
+        lines.append(f"| **Total** | **{nsuites}** | **{total['FAIL']:,}** | "
+                     f"**{total['BUILDFAIL']:,}** | **{total['DIFF']:,}** | **{total['PASS']:,}** | "
+                     f"**{total['NOTRUN']:,}** |")
         lines += ["", format_excluded_old(rep, standalone)]
         if standalone:
             lines += [""] + to_markdown("\n".join(format_coverage(rep["coverage"], slack=False)), title=False).splitlines()
@@ -1031,13 +1118,14 @@ def format_slack_summary(rep, details_where):
     """A few lines for the channel: totals per category, coverage, and where the
     details are. details_where is a short mrkdwn phrase, or None."""
     lines = format_header(rep, slack=True)
-    for label, standalone in REPORT_SECTIONS:
+    for label, standalone in report_sections(rep):
         lines += format_section_header(rep, standalone, slack=True)
         lines += format_group_summary(rep, standalone, slack=True)
         lines.append(format_excluded_old(rep, standalone))
         if standalone and rep["coverage"]:
             lines.append("• *Coverage:* " + " · ".join(
-                f"{slack_escape(c['site'])} {c['emoji']} {c['percentage']:.1f}%" for c in rep["coverage"]))
+                f"{slack_escape(c['site'])} {c['percentage']:.1f}% ({coverage_status(c)})"
+                for c in rep["coverage"]))
     if details_where:
         lines.append(details_where)
     return "\n".join(lines)
@@ -1048,7 +1136,7 @@ def format_thread(rep, with_file):
     note = ("_Log excerpts behind each likely cause are in the report file below._" if with_file
             else None)
     lines = []
-    for label, standalone in REPORT_SECTIONS:
+    for label, standalone in report_sections(rep):
         lines += format_section_header(rep, standalone, slack=True)
         lines += format_details(rep, note, slack=True, standalone=standalone)
         lines.append("")
@@ -1220,7 +1308,9 @@ def deliver_slack(rep, full_text, md_path):
                     time.sleep(1)
                 done.append(f"{len(parts)} thread repl{'ies' if len(parts) > 1 else 'y'}")
             if details in ("both", "file"):
-                slack_upload(token, channel, ts, md_path, f"EAMxx report {rep['date']}",
+                profile = rep.get("profile", PROFILE_ALL)
+                slack_upload(token, channel, ts, md_path,
+                             f"EAMxx {PROFILE_LABELS[profile]} report {rep['date']}",
                              "Full report, including the log lines behind each likely cause.")
                 done.append("report file")
         except SlackPostError as e:
@@ -1246,13 +1336,6 @@ def run_url():
 
 
 # --------------------------------------------------------------------------- readable copy
-EMOJI_UNICODE = {
-    ":white_check_mark:": "✅", ":x:": "❌", ":hammer_and_wrench:": "🛠️",
-    ":large_orange_diamond:": "🔶", ":hourglass_flowing_sand:": "⏳", ":tada:": "🎉",
-    ":large_green_circle:": "🟢", ":large_yellow_circle:": "🟡", ":red_circle:": "🔴",
-}
-
-
 def to_markdown(text, title=True):
     """Convert the Slack-formatted report to standard Markdown, readable as plain
     text too, and rendered nicely in the GitHub job summary."""
@@ -1260,8 +1343,6 @@ def to_markdown(text, title=True):
     for line in text.split("\n"):
         line = re.sub(r"<([^|>]+)\|([^>]+)>", r"[\2](\1)", line)
         line = re.sub(r"(?<![\w*])\*([^*\n]+)\*(?![\w*])", r"**\1**", line)
-        for code, char in EMOJI_UNICODE.items():
-            line = line.replace(code, char)
         # Slack indents with spaces; in Markdown 4+ leading spaces would make a code
         # block, so turn indentation into list nesting instead.
         indent = len(line) - len(line.lstrip(" "))
@@ -1277,20 +1358,26 @@ def to_markdown(text, title=True):
 
 
 
-def main():
+def make_parser():
     ap = argparse.ArgumentParser(
         description="Report EAMxx test results from the E3SM CDash dashboard. "
                     "Posts to Slack with SLACK_BOT_TOKEN plus SLACK_CHANNEL_ID, "
                     "or falls back to SLACK_WEBHOOK_URL.")
     ap.add_argument("--date", help="CDash testing day YYYY-MM-DD (default: current)")
+    ap.add_argument("--profile", choices=PROFILES, default=PROFILE_ALL,
+                    help="which tests to report (default: all EAMxx tests)")
     ap.add_argument("--dry-run", action="store_true", help="don't post to Slack")
     ap.add_argument("--output-dir", default="cdash_report",
                     help="where to save the readable report (default: ./cdash_report)")
-    args = ap.parse_args()
+    return ap
+
+
+def main(argv=None):
+    args = make_parser().parse_args(argv)
 
     print("Fetching results from my.cdash.org (this takes a minute or two)...", file=sys.stderr)
     try:
-        rep = collect(args.date)
+        rep = collect(args.date, profile=args.profile)
     except (urllib.error.URLError, ssl.SSLError, TimeoutError, OSError) as e:
         print(f"\nError fetching CDash data: {e}", file=sys.stderr)
         return 1
@@ -1299,10 +1386,16 @@ def main():
 
     # 1. Always save a readable copy first, so a Slack problem can't lose the report.
     os.makedirs(args.output_dir, exist_ok=True)
-    md_path = os.path.join(args.output_dir, f"cdash_eamxx_report_{rep['date']}.md")
+    if args.profile == PROFILE_ALL:
+        report_filename = f"cdash_eamxx_report_{rep['date']}.md"
+        slack_filename = "slack_message.txt"
+    else:
+        report_filename = f"cdash_eamxx_report_{args.profile}_{rep['date']}.md"
+        slack_filename = f"slack_message_{args.profile}_{rep['date']}.txt"
+    md_path = os.path.join(args.output_dir, report_filename)
     with open(md_path, "w", encoding="utf-8") as f:
         f.write(md)
-    with open(os.path.join(args.output_dir, "slack_message.txt"), "w", encoding="utf-8") as f:
+    with open(os.path.join(args.output_dir, slack_filename), "w", encoding="utf-8") as f:
         f.write(slack_text + "\n")  # exact Slack text, handy for pasting in by hand
 
     # 2. Readable copy in the GitHub Actions job summary and the log.
@@ -1324,8 +1417,8 @@ def main():
               file=sys.stderr)
         if os.environ.get("GITHUB_STEP_SUMMARY"):
             with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
-                f.write(f"\n> ⚠️ **{msg}**\n> The full report is above and in the "
-                        f"`cdash-eamxx-report` artifact.\n")
+                f.write(f"\n> **{msg}**\n> The full report is above and in the "
+                        f"`cdash-eamxx-report-{args.profile}` artifact.\n")
         return 2  # nonzero so the workflow run shows red and someone notices
     if posted:
         print(f"Posted to Slack: {posted}.", file=sys.stderr)
