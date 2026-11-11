@@ -928,7 +928,8 @@ def section_groups(rep, standalone):
     """Yield (group, builds) for one report section."""
     for group in rep["groups"]:
         builds = [b for b in group["builds"] if is_standalone_suite(b["name"]) == standalone]
-        if builds or (group["missing"] and not standalone):
+        if builds or (group["missing"] and
+                      (not standalone or rep.get("profile", PROFILE_ALL) == PROFILE_UNIT)):
             yield group, builds
 
 
