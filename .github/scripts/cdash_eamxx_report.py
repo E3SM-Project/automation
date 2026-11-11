@@ -79,6 +79,7 @@ GROUPS = {
     "E3SM_MustPass": "eamxx",
 }
 NAME_FILTER = "eamxx"
+REPORT_SECTIONS = (("CIME-based tests", False), ("Standalone tests", True))
 MAX_SUITE_AGE_HOURS = 18
 MAX_SUITE_AGE_SECONDS = MAX_SUITE_AGE_HOURS * 60 * 60
 
@@ -183,7 +184,7 @@ def collect(date, now=None):
     for gname, mode in GROUPS.items():
         g = by_name.get(gname)
         group = {"name": gname, "mode": mode, "builds": [], "missing": g is None,
-                 "excluded_old": 0}
+                 "excluded_old": 0, "excluded_old_cime": 0, "excluded_old_standalone": 0}
         for b in (g or {}).get("builds", []):
             tests = paged(TESTS_Q, b["id"], "tests")
             if mode == NAME_FILTER:
@@ -197,6 +198,8 @@ def collect(date, now=None):
                 started_at = None  # keep suites CDash did not timestamp
             if started_at is not None and started_at < cutoff:
                 group["excluded_old"] += 1
+                key = "excluded_old_standalone" if is_standalone_suite(b["buildname"]) else "excluded_old_cime"
+                group[key] += 1
                 continue
 
             # Build errors: CDash puts the failing test's name in stdError/stdOutput.
@@ -758,6 +761,41 @@ def format_failures(ts, slack=False):
     return out
 
 
+def diff_signature(test):
+    """The baseline state and diagnostics that make two DIFFs equivalent."""
+    if test.get("bless"):
+        baseline = ("bless", *test["bless"])
+    elif test.get("baseline_exception"):
+        baseline = ("exception",)
+    else:
+        baseline = ("unknown",)
+    return baseline, tuple(test.get("diff_diagnostics", []))
+
+
+def format_diff_tallies(diffs, slack=False):
+    """Concise DIFF tallies, grouped by their baseline state and diagnostics."""
+    tallies, first_seen = Counter(), {}
+    for index, test in enumerate(diffs):
+        signature = diff_signature(test)
+        tallies[signature] += 1
+        first_seen.setdefault(signature, index)
+
+    lines = []
+    for signature, count in sorted(tallies.items(), key=lambda item: (-item[1], first_seen[item[0]])):
+        baseline, diagnostics = signature
+        if baseline[0] == "bless":
+            _, sha, date = baseline
+            info = f"sha `{sha[:12]}` · blessed {display(date, slack)}"
+        elif baseline[0] == "exception":
+            info = "_baseline comparison raised an exception; no bless info in log_"
+        else:
+            info = "_bless info not found in log_"
+        info += "".join(f" · {display(diagnostic, slack)}" for diagnostic in diagnostics)
+        prefix = f"All {count}" if len(tallies) == 1 and count > 1 else str(count)
+        lines.append(f"      • {prefix}: {info}")
+    return lines
+
+
 FENCE = "`" * 3
 
 
@@ -814,6 +852,30 @@ def format_coverage(cov, slack=False):
     return lines
 
 
+def is_standalone_suite(name):
+    """Whether a CDash suite contains standalone/unit tests rather than CIME tests."""
+    name = name.lower()
+    return "unit_tests" in name or "scripts_tests" in name
+
+
+def section_groups(rep, standalone):
+    """Yield (group, builds) for one report section."""
+    for group in rep["groups"]:
+        builds = [b for b in group["builds"] if is_standalone_suite(b["name"]) == standalone]
+        if builds or (group["missing"] and not standalone):
+            yield group, builds
+
+
+def section_totals(rep, standalone):
+    total = Counter()
+    nsuites = 0
+    for _, builds in section_groups(rep, standalone):
+        for build in builds:
+            total += build["counts"]
+            nsuites += 1
+    return total, nsuites
+
+
 def report_totals(rep):
     total = Counter()
     for g in rep["groups"]:
@@ -838,19 +900,25 @@ def format_header(rep, slack=False):
     total, nsuites = report_totals(rep)
     return [f"*E3SM CDash EAMxx report: testing day {display(rep['date'], slack)}*",
             f"<{CDASH}/index.php?project={PROJECT}&date={rep['date']}|Dashboard> · "
-            f"{nsuites} suites · {sum(total.values()):,} tests · {counts_str(total)}"]
+             f"{nsuites} suites · {sum(total.values()):,} tests · {counts_str(total)}"]
 
 
-def format_group_summary(rep, slack=False):
+def format_section_header(rep, standalone, slack=False):
+    total, nsuites = section_totals(rep, standalone)
+    label = "Standalone tests" if standalone else "CIME-based tests"
+    return [f"*{label}* · {nsuites} suites · {sum(total.values()):,} tests · {counts_str(total)}"]
+
+
+def format_group_summary(rep, standalone, slack=False):
     """One aggregate line per test group, without listing individual suites."""
     lines = []
-    for g in rep["groups"]:
+    for g, builds in section_groups(rep, standalone):
         if g["missing"]:
             lines.append(f"• *{display(g['name'], slack)}*: _group not present on the dashboard today_")
             continue
-        counts = sum((b["counts"] for b in g["builds"]), Counter())
-        nbuilds = len(g["builds"])
-        problems = sum(has_problems(b) for b in g["builds"])
+        counts = sum((b["counts"] for b in builds), Counter())
+        nbuilds = len(builds)
+        problems = sum(has_problems(b) for b in builds)
         line = (f"• *{display(g['name'], slack)}* ({nbuilds} suite{'s' if nbuilds != 1 else ''}): "
                 f"{counts_str(counts)}")
         if problems:
@@ -859,20 +927,32 @@ def format_group_summary(rep, slack=False):
     return lines
 
 
-def format_excluded_old(rep):
+def format_excluded_old(rep, standalone=None):
     """Briefly report suites skipped because their CDash build start is stale."""
-    total = sum(g["excluded_old"] for g in rep["groups"])
-    by_group = " · ".join(f"{g['name']}: {g['excluded_old']}" for g in rep["groups"]
-                          if g["excluded_old"])
+    if standalone is None:
+        key = "excluded_old"
+    else:
+        key = "excluded_old_standalone" if standalone else "excluded_old_cime"
+    def count(group):
+        # The fallback keeps formatting fixtures and reports created before the
+        # section split compatible with the new renderer.
+        return group.get(key, group.get("excluded_old", 0) if standalone is False else 0)
+
+    total = sum(count(g) for g in rep["groups"])
+    by_group = " · ".join(f"{g['name']}: {count(g)}" for g in rep["groups"] if count(g))
     detail = by_group or "none"
     return (f"*Suites excluded as older than {MAX_SUITE_AGE_HOURS} hours:* "
             f"{total} ({detail})")
 
 
-def format_details(rep, evidence_note=None, slack=False):
+def format_details(rep, evidence_note=None, slack=False, standalone=None):
     """FAILs, BUILD FAILs and DIFFs, suite by suite."""
     lines = []
-    problems = [(g, b) for g in rep["groups"] for b in g["builds"] if has_problems(b)]
+    if standalone is None:
+        groups = [(g, g["builds"]) for g in rep["groups"]]
+    else:
+        groups = list(section_groups(rep, standalone))
+    problems = [(g, b) for g, builds in groups for b in builds if has_problems(b)]
     lines.append("*Details: FAILs, BUILD FAILs and DIFFs*" if problems
                  else "*No FAILs, BUILD FAILs or DIFFs* :tada:")
     for g, b in problems:
@@ -897,80 +977,67 @@ def format_details(rep, evidence_note=None, slack=False):
         diffs = [t for t in b["tests"] if t["bucket"] == "DIFF"]
         if diffs:
             lines.append(f"  {EMOJI['DIFF']} *DIFF ({len(diffs)})*")
-            blesses = {t["bless"] for t in diffs}
-            shared_bless = len(diffs) > 1 and len(blesses) == 1 and None not in blesses
-            shared_diagnostics = {
-                diagnostic for diagnostic in DIFF_DIAGNOSTICS.values()
-                if len(diffs) > 1 and all(diagnostic in t.get("diff_diagnostics", []) for t in diffs)
-            }
-            if shared_bless:
-                sha, date = blesses.pop()
-                lines.append(f"      _All DIFFs have the same sha and baseline date:_ "
-                             f"sha `{sha[:12]}` · blessed {display(date, slack)}")
-            for diagnostic in (DIFF_DIAGNOSTICS.values()):
-                if diagnostic in shared_diagnostics:
-                    lines.append(f"      _All DIFFs report: {display(diagnostic, slack)}._")
-
-            for t in diffs:
-                info = []
-                if not shared_bless:
-                    if t["bless"]:
-                        info.append(f"sha `{t['bless'][0][:12]}` · blessed "
-                                    f"{display(t['bless'][1], slack)}")
-                    elif t.get("baseline_exception"):
-                        info.append("_baseline comparison raised an exception; no bless info in log_")
-                    else:
-                        info.append("_bless info not found in log_")
-                info.extend(display(diagnostic, slack) for diagnostic in t.get("diff_diagnostics", [])
-                            if diagnostic not in shared_diagnostics)
-                lines.append(f"      • {tlink(t, slack)}" + (f": {' · '.join(info)}" if info else ""))
-    if any(t.get("likely_cause") for g in rep["groups"] for b in g["builds"] for t in b["tests"]):
+            lines += format_diff_tallies(diffs, slack)
+    if any(t.get("likely_cause") for _, builds in groups for b in builds for t in b["tests"]):
         lines += ["", evidence_note or evidence_link()]
     return lines
 
 
 def format_report(rep, slack=False):
-    """Compact report: aggregate status, stale count, coverage, and problems."""
-    return "\n".join(format_header(rep, slack) + [""] + format_group_summary(rep, slack)
-                     + [format_excluded_old(rep), ""] + format_coverage(rep["coverage"], slack) + [""]
-                     + format_details(rep, slack=slack))
+    """Compact report with separate CIME-based and standalone test sections."""
+    lines = format_header(rep, slack) + [""]
+    for label, standalone in REPORT_SECTIONS:
+        lines += format_section_header(rep, standalone, slack)
+        lines += format_group_summary(rep, standalone, slack)
+        lines += [format_excluded_old(rep, standalone)]
+        if standalone:
+            lines += format_coverage(rep["coverage"], slack)
+        lines += [""] + format_details(rep, slack=slack, standalone=standalone) + [""]
+    return "\n".join(lines).rstrip()
 
 
 def format_markdown_report(rep):
-    """Markdown report with a table for aligned per-group test-status counts."""
+    """Markdown report with separate tables for CIME and standalone tests."""
     total, nsuites = report_totals(rep)
     lines = [
         f"## E3SM CDash EAMxx report: testing day {rep['date']}",
         f"[Dashboard]({CDASH}/index.php?project={PROJECT}&date={rep['date']}) · "
         f"{nsuites} suites · {sum(total.values()):,} tests",
         "",
-        "| Group | Suites | PASS | FAIL | BUILD FAIL | DIFF | Not run |",
-        "|---|---:|---:|---:|---:|---:|---:|",
     ]
-    for g in rep["groups"]:
-        if g["missing"]:
-            lines.append(f"| {g['name']} | — | — | — | — | — | — |")
-            continue
-        counts = sum((b["counts"] for b in g["builds"]), Counter())
-        lines.append(f"| {g['name']} | {len(g['builds'])} | {counts['PASS']:,} | "
-                     f"{counts['FAIL']:,} | {counts['BUILDFAIL']:,} | {counts['DIFF']:,} | "
-                     f"{counts['NOTRUN']:,} |")
-    lines.append(f"| **Total** | **{nsuites}** | **{total['PASS']:,}** | **{total['FAIL']:,}** | "
-                 f"**{total['BUILDFAIL']:,}** | **{total['DIFF']:,}** | **{total['NOTRUN']:,}** |")
-    lines += ["", format_excluded_old(rep), ""]
-    lines += to_markdown("\n".join(format_coverage(rep["coverage"], slack=False)), title=False).splitlines()
-    lines += [""] + to_markdown("\n".join(format_details(rep)), title=False).splitlines()
+    for label, standalone in REPORT_SECTIONS:
+        total, nsuites = section_totals(rep, standalone)
+        lines += [f"### {label}", "", "| Group | Suites | PASS | FAIL | BUILD FAIL | DIFF | Not run |",
+                  "|---|---:|---:|---:|---:|---:|---:|"]
+        for g, builds in section_groups(rep, standalone):
+            if g["missing"]:
+                lines.append(f"| {g['name']} | — | — | — | — | — | — |")
+                continue
+            counts = sum((b["counts"] for b in builds), Counter())
+            lines.append(f"| {g['name']} | {len(builds)} | {counts['PASS']:,} | "
+                         f"{counts['FAIL']:,} | {counts['BUILDFAIL']:,} | {counts['DIFF']:,} | "
+                         f"{counts['NOTRUN']:,} |")
+        lines.append(f"| **Total** | **{nsuites}** | **{total['PASS']:,}** | **{total['FAIL']:,}** | "
+                     f"**{total['BUILDFAIL']:,}** | **{total['DIFF']:,}** | **{total['NOTRUN']:,}** |")
+        lines += ["", format_excluded_old(rep, standalone)]
+        if standalone:
+            lines += [""] + to_markdown("\n".join(format_coverage(rep["coverage"], slack=False)), title=False).splitlines()
+        lines += [""] + to_markdown("\n".join(format_details(rep, standalone=standalone)), title=False).splitlines()
+        lines.append("")
     return "\n".join(lines) + "\n"
 
 
 def format_slack_summary(rep, details_where):
     """A few lines for the channel: totals per category, coverage, and where the
     details are. details_where is a short mrkdwn phrase, or None."""
-    lines = format_header(rep, slack=True) + format_group_summary(rep, slack=True)
-    lines.append(format_excluded_old(rep))
-    if rep["coverage"]:
-        lines.append("• *Coverage:* " + " · ".join(
-            f"{slack_escape(c['site'])} {c['emoji']} {c['percentage']:.1f}%" for c in rep["coverage"]))
+    lines = format_header(rep, slack=True)
+    for label, standalone in REPORT_SECTIONS:
+        lines += format_section_header(rep, standalone, slack=True)
+        lines += format_group_summary(rep, standalone, slack=True)
+        lines.append(format_excluded_old(rep, standalone))
+        if standalone and rep["coverage"]:
+            lines.append("• *Coverage:* " + " · ".join(
+                f"{slack_escape(c['site'])} {c['emoji']} {c['percentage']:.1f}%" for c in rep["coverage"]))
     if details_where:
         lines.append(details_where)
     return "\n".join(lines)
@@ -980,7 +1047,12 @@ def format_thread(rep, with_file):
     """What goes in the thread under the summary: only problem details."""
     note = ("_Log excerpts behind each likely cause are in the report file below._" if with_file
             else None)
-    return "\n".join(format_details(rep, note, slack=True))
+    lines = []
+    for label, standalone in REPORT_SECTIONS:
+        lines += format_section_header(rep, standalone, slack=True)
+        lines += format_details(rep, note, slack=True, standalone=standalone)
+        lines.append("")
+    return "\n".join(lines).rstrip()
 
 
 
