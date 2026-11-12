@@ -776,6 +776,14 @@ def tlink(t, slack=False):
     return f"<{CDASH}/tests/{t['id']}|`{display(t['name'], slack)}`>"
 
 
+def commit_link(sha, slack=False):
+    """Link a commit SHA in Slack markup, also convertible to Markdown."""
+    label = f"`{display(sha[:12], slack)}`"
+    if re.fullmatch(r"[0-9a-fA-F]{7,40}", sha):
+        return f"<{GITHUB_REPO}/commit/{sha}|{label}>"
+    return label
+
+
 def counts_str(c, show_zero=("PASS", "FAIL", "BUILDFAIL", "DIFF")):
     summary_order = ("FAIL", "BUILDFAIL", "DIFF", "PASS", "NOTRUN")
     parts = [f"{LABEL[k]} {c[k]:,}" for k in summary_order if c[k] or k in show_zero]
@@ -826,7 +834,7 @@ def format_diff_tallies(diffs, slack=False):
         baseline, diagnostics = signature
         if baseline[0] == "bless":
             _, sha = baseline
-            info = f"sha `{sha[:12]}`"
+            info = f"sha {commit_link(sha, slack)}"
             days = bless_days[signature]
             if days - {None}:
                 info += f" · blessed {', '.join(sorted(days - {None}))}"
@@ -1049,7 +1057,7 @@ def format_details(rep, evidence_note=None, slack=False, standalone=None):
             lines.append(f"  Started: {started_at}")
         if b.get("commit"):
             sha, source = b["commit"]
-            lines.append(f"  Commit tested: <{GITHUB_REPO}/commit/{sha}|`{sha[:12]}`>"
+            lines.append(f"  Commit tested: {commit_link(sha, slack)}"
                          + (" _(from test logs)_" if source == "test log" else ""))
         else:
             lines.append("  Commit tested: _not recorded in CDash for this suite_")

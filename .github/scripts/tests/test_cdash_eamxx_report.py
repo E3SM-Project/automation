@@ -219,12 +219,18 @@ class FormattingTests(unittest.TestCase):
         )
 
         tallies = "\n".join(REPORT.format_diff_tallies(diffs))
-        self.assertIn("7: sha `5b1427fe20eb` · blessed 2026-09-23, 2026-09-24 · field lists differ "
+        self.assertIn("7: sha <https://github.com/E3SM-Project/E3SM/commit/5b1427fe20eb1234|"
+                      "`5b1427fe20eb`> · blessed 2026-09-23, 2026-09-24 · field lists differ "
                       "(otherwise bit-for-bit)", tallies)
         self.assertNotIn("12:34:51", tallies)
         self.assertNotIn("12:35:07", tallies)
         self.assertIn("16: _bless info not found in log_ · baseline directory is missing", tallies)
-        self.assertIn("12: sha `ca0b1c1b1da1` · blessed 2026-10-15", tallies)
+        self.assertIn("12: sha <https://github.com/E3SM-Project/E3SM/commit/ca0b1c1b1da1234|"
+                      "`ca0b1c1b1da1`> · blessed 2026-10-15", tallies)
+        markdown = REPORT.to_markdown(tallies, title=False)
+        self.assertIn("[`5b1427fe20eb`](https://github.com/E3SM-Project/E3SM/commit/"
+                      "5b1427fe20eb1234)", markdown)
+        self.assertEqual(REPORT.commit_link("unknown"), "`unknown`")
 
 
 if __name__ == "__main__":
