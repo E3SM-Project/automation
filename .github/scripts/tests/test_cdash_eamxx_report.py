@@ -12,6 +12,39 @@ SPEC.loader.exec_module(REPORT)
 
 
 class CollectTests(unittest.TestCase):
+    def test_unit_build_error_without_failed_test_is_reported_separately(self):
+        build = {"id": "coverage-build", "site": "ghci-cuda",
+                 "buildname": "scream_unit_tests_test_coverage", "builddatefull": 1_000_000,
+                 "compilation": {"error": 1}}
+        index = {"date": "2026-11-19", "buildgroups": [{"name": "E3SM_EAMXX", "builds": [build]}]}
+
+        def paged(query, build_id, field, variables=None):
+            self.assertEqual(build_id, "coverage-build")
+            if query is REPORT.TESTS_Q:
+                return [{"id": "passing", "name": "passing-test", "status": "PASSED", "details": ""}]
+            self.assertIs(query, REPORT.BUILD_ERRORS_Q)
+            return [{"stdError": "test_coverage failed to build", "stdOutput": ""}]
+
+        with patch.object(REPORT, "GROUPS", {"E3SM_EAMXX": "all"}), \
+             patch.object(REPORT, "http_json", return_value=index), \
+             patch.object(REPORT, "paged", side_effect=paged), \
+             patch.object(REPORT, "triage_build_tests"), \
+             patch.object(REPORT, "find_commit", return_value=None):
+            result = REPORT.collect("2026-11-19", now=1_000_000, profile=REPORT.PROFILE_UNIT)
+
+        suite = result["groups"][0]["builds"][0]
+        self.assertEqual(suite["counts"], Counter({"PASS": 1}))
+        self.assertEqual(suite["orphan_build_errors"], 1)
+        summary = REPORT.format_slack_summary(result, None)
+        table = summary.split("```")[1].strip("\n").splitlines()
+        self.assertEqual(table[2].split(), ["E3SM_EAMXX", "1", "0", "0", "0", "1", "0", "1", "1"])
+        self.assertEqual(table[3].split(), ["Total", "1", "0", "0", "0", "1", "0", "1", "1"])
+        self.assertIn("scream_unit_tests_test_coverage", summary)
+        self.assertIn("Build errors are not tied to a test", summary)
+        self.assertIn("| E3SM_EAMXX | 1 | 0 | 0 | 0 | 1 | 0 | 1 |",
+                      REPORT.format_markdown_report(result))
+        self.assertIn("build errors 1", REPORT.format_report(result))
+
     def test_collect_excludes_only_old_matching_suites(self):
         now = 1_000_000
         cutoff = now - REPORT.MAX_SUITE_AGE_SECONDS
@@ -117,8 +150,8 @@ class SectionTests(unittest.TestCase):
         self.assertIn("Coverage", report)
         self.assertIn("### CIME-based tests", markdown)
         self.assertIn("### Standalone tests", markdown)
-        self.assertIn("| group | 1 | 0 | 0 | 0 | 3 | 0 |", markdown)
-        self.assertIn("| group | 2 | 0 | 0 | 0 | 6,002 | 0 |", markdown)
+        self.assertIn("| group | 1 | 0 | 0 | 0 | 3 | 0 | 0 |", markdown)
+        self.assertIn("| group | 2 | 0 | 0 | 0 | 6,002 | 0 | 0 |", markdown)
         self.assertEqual(summary.count("Coverage"), 1)
         self.assertIn("CIME-based tests", thread)
         self.assertIn("Standalone tests", thread)
@@ -143,7 +176,7 @@ class SectionTests(unittest.TestCase):
 class FormattingTests(unittest.TestCase):
     def test_slack_summary_aligns_counts_for_groups_and_totals(self):
         def build(name, counts, orphan_build_errors=0):
-            return {"name": name, "counts": Counter(counts),
+            return {"id": name, "site": "site", "name": name, "counts": Counter(counts),
                     "orphan_build_errors": orphan_build_errors}
 
         rep = {"date": "2026-11-04", "profile": REPORT.PROFILE_CIME, "coverage": [],
@@ -163,13 +196,13 @@ class FormattingTests(unittest.TestCase):
         self.assertEqual(len(table), 6)
         self.assertEqual(table[0].split(),
                          ["Group", "Suites", "FAIL", "BUILD", "FAIL", "DIFF", "PASS",
-                          "Not", "run", "Attention"])
-        self.assertEqual(table[2].split(), ["E3SM_EAMXX", "2", "1", "0", "0", "150", "8", "1"])
+                          "Not", "run", "Build", "errors", "Attention"])
+        self.assertEqual(table[2].split(), ["E3SM_EAMXX", "2", "1", "0", "0", "150", "8", "0", "1"])
         self.assertEqual(table[3].split(),
-                         ["E3SM_MustPass_wBaselines", "1", "0", "0", "4", "7", "0", "1"])
-        self.assertEqual(table[4].split(), ["E3SM_MustPass", "missing", "—", "—", "—", "—", "—", "—"])
-        self.assertEqual(table[5].split(), ["Total", "3", "1", "0", "4", "157", "8", "2"])
-        for column in ("Suites", "FAIL", "BUILD FAIL", "DIFF", "PASS", "Not run", "Attention"):
+                         ["E3SM_MustPass_wBaselines", "1", "0", "0", "4", "7", "0", "1", "1"])
+        self.assertEqual(table[4].split(), ["E3SM_MustPass", "missing", "—", "—", "—", "—", "—", "—", "—"])
+        self.assertEqual(table[5].split(), ["Total", "3", "1", "0", "4", "157", "8", "1", "2"])
+        for column in ("Suites", "FAIL", "BUILD FAIL", "DIFF", "PASS", "Not run", "Build errors", "Attention"):
             position = table[0].index(column) + len(column) - 1
             self.assertTrue(all(row[position] != " " for row in table[2:]), column)
         self.assertIn("Suites excluded as older than 18 hours:* 8", summary)
@@ -212,8 +245,8 @@ class FormattingTests(unittest.TestCase):
         self.assertNotIn("passing-suite", report)
         self.assertIn("failure-name", report)
         self.assertIn("the likely cause", report)
-        self.assertIn("| Group | Suites | FAIL | BUILD FAIL | DIFF | PASS | Not run |", markdown)
-        self.assertIn("| group | 2 | 1 | 0 | 0 | 1 | 0 |", markdown)
+        self.assertIn("| Group | Suites | FAIL | BUILD FAIL | DIFF | PASS | Not run | Build errors |", markdown)
+        self.assertIn("| group | 2 | 1 | 0 | 0 | 1 | 0 | 0 |", markdown)
         self.assertIn("- Started: 1970-01-01 00:00 UTC", markdown)
         self.assertIn("Suites excluded as older than 18 hours:* 2", summary)
         self.assertNotIn("passing-suite", thread)

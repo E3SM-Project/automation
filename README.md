@@ -68,7 +68,9 @@ Secrets tab, variables on the Variables tab).
 channel it posts a richer report instead (a short summary in the channel, the
 details in a thread, and the full report as a file); without them it uses the
 webhook above. The Slack summary shows each test group and the section total in
-an aligned, monospaced count table, including suites needing attention:
+an aligned, monospaced count table, including suites needing attention. Build
+errors without a failed test are counted separately and link to the affected
+suite; they are not included in the test counts:
 
 | Name | Kind | What it is |
 | --- | --- | --- |

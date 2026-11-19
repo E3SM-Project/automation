@@ -971,6 +971,11 @@ def report_totals(rep):
     return total, sum(len(g["builds"]) for g in rep["groups"])
 
 
+def build_error_total(builds):
+    """Build errors with no corresponding failed test (not part of test counts)."""
+    return sum(build["orphan_build_errors"] for build in builds)
+
+
 def has_problems(b):
     c = b["counts"]
     return bool(c["FAIL"] or c["BUILDFAIL"] or c["DIFF"] or b["orphan_build_errors"])
@@ -985,20 +990,24 @@ def suite_started_at(b):
 
 def format_header(rep, slack=False, show_counts=True):
     total, nsuites = report_totals(rep)
+    build_errors = build_error_total(b for g in rep["groups"] for b in g["builds"])
     profile = rep.get("profile", PROFILE_ALL)
     title = "E3SM CDash EAMxx report" if profile == PROFILE_ALL else (
         f"E3SM CDash EAMxx {PROFILE_LABELS[profile]} report")
     dashboard = (f"<{CDASH}/index.php?project={PROJECT}&date={rep['date']}|Dashboard> · "
                  f"{nsuites} suites · {sum(total.values()):,} tests")
     return [f"*{title}: testing day {display(rep['date'], slack)}*",
-            dashboard + (f" · {counts_str(total)}" if show_counts else "")]
+            dashboard + (f" · {counts_str(total)}" if show_counts else "") +
+            (f" · build errors {build_errors:,}" if show_counts and build_errors else "")]
 
 
 def format_section_header(rep, standalone, slack=False, show_counts=True):
     total, nsuites = section_totals(rep, standalone)
+    build_errors = build_error_total(b for _, builds in section_groups(rep, standalone) for b in builds)
     label = "Standalone tests" if standalone else "CIME-based tests"
     return [f"*{label}* · {nsuites} suites · {sum(total.values()):,} tests" +
-            (f" · {counts_str(total)}" if show_counts else "")]
+            (f" · {counts_str(total)}" if show_counts else "") +
+            (f" · build errors {build_errors:,}" if show_counts and build_errors else "")]
 
 
 def format_group_summary(rep, standalone, slack=False):
@@ -1017,6 +1026,9 @@ def format_group_summary(rep, standalone, slack=False):
         problems = sum(has_problems(b) for b in builds)
         line = (f"• *{display(g['name'], slack)}* ({nbuilds} suite{'s' if nbuilds != 1 else ''}): "
                 f"{counts_str(counts)}")
+        build_errors = build_error_total(builds)
+        if build_errors:
+            line += f" · build errors {build_errors:,}"
         if problems:
             line += f" · _{problems} suite{'s' if problems != 1 else ''} need{'s' if problems == 1 else ''} attention_"
         lines.append(line)
@@ -1025,7 +1037,8 @@ def format_group_summary(rep, standalone, slack=False):
 
 def format_slack_table(rep, standalone):
     """Align group counts in Slack, which does not render Markdown tables."""
-    headings = ("Group", "Suites", "FAIL", "BUILD FAIL", "DIFF", "PASS", "Not run", "Attention")
+    headings = ("Group", "Suites", "FAIL", "BUILD FAIL", "DIFF", "PASS", "Not run",
+                "Build errors", "Attention")
     rows = []
     groups = list(section_groups(rep, standalone))
     if not any(builds or group["missing"] for group, builds in groups):
@@ -1033,15 +1046,17 @@ def format_slack_table(rep, standalone):
     for group, builds in groups:
         name = slack_escape(group["name"]).replace("`", "'").replace("\n", " ").replace("\r", " ")
         if group["missing"]:
-            rows.append((name, "missing", *("—",) * 6))
+            rows.append((name, "missing", *("—",) * 7))
             continue
         counts = sum((build["counts"] for build in builds), Counter())
         rows.append((name, str(len(builds)), *(f"{counts[key]:,}" for key in
                      ("FAIL", "BUILDFAIL", "DIFF", "PASS", "NOTRUN")),
+                     f"{build_error_total(builds):,}",
                      str(sum(has_problems(build) for build in builds))))
     total, nsuites = section_totals(rep, standalone)
     rows.append(("Total", str(nsuites), *(f"{total[key]:,}" for key in
                  ("FAIL", "BUILDFAIL", "DIFF", "PASS", "NOTRUN")),
+                 f"{build_error_total(build for _, builds in groups for build in builds):,}",
                  str(sum(has_problems(build) for _, builds in groups
                          for build in builds))))
     widths = [max(len(row[index]) for row in [headings, *rows]) for index in range(len(headings))]
@@ -1134,19 +1149,22 @@ def format_markdown_report(rep):
     ]
     for label, standalone in report_sections(rep):
         total, nsuites = section_totals(rep, standalone)
-        lines += [f"### {label}", "", "| Group | Suites | FAIL | BUILD FAIL | DIFF | PASS | Not run |",
-                  "|---|---:|---:|---:|---:|---:|---:|"]
+        lines += [f"### {label}", "", "| Group | Suites | FAIL | BUILD FAIL | DIFF | PASS | Not run | Build errors |",
+                  "|---|---:|---:|---:|---:|---:|---:|---:|"]
         for g, builds in section_groups(rep, standalone):
             if g["missing"]:
-                lines.append(f"| {g['name']} | — | — | — | — | — | — |")
+                lines.append(f"| {g['name']} | — | — | — | — | — | — | — |")
                 continue
             counts = sum((b["counts"] for b in builds), Counter())
             lines.append(f"| {g['name']} | {len(builds)} | {counts['FAIL']:,} | "
                          f"{counts['BUILDFAIL']:,} | {counts['DIFF']:,} | {counts['PASS']:,} | "
-                         f"{counts['NOTRUN']:,} |")
+                         f"{counts['NOTRUN']:,} | {build_error_total(builds):,} |")
         lines.append(f"| **Total** | **{nsuites}** | **{total['FAIL']:,}** | "
                      f"**{total['BUILDFAIL']:,}** | **{total['DIFF']:,}** | **{total['PASS']:,}** | "
-                     f"**{total['NOTRUN']:,}** |")
+                     f"**{total['NOTRUN']:,}** | "
+                     f"**{build_error_total(b for _, builds in section_groups(rep, standalone) for b in builds):,}** |")
+        if build_error_total(b for _, builds in section_groups(rep, standalone) for b in builds):
+            lines += ["", "Build errors are not tied to a test and are not included in the test counts."]
         lines += ["", format_excluded_old(rep, standalone)]
         if standalone:
             lines += [""] + to_markdown("\n".join(format_coverage(rep["coverage"], slack=False)), title=False).splitlines()
@@ -1162,6 +1180,12 @@ def format_slack_summary(rep, details_where):
     for label, standalone in report_sections(rep):
         lines += format_section_header(rep, standalone, slack=True, show_counts=False)
         lines += format_slack_table(rep, standalone)
+        orphan_builds = [b for _, builds in section_groups(rep, standalone) for b in builds
+                         if b["orphan_build_errors"]]
+        if orphan_builds:
+            lines.append("_Build errors are not tied to a test and are not included in the test counts._")
+            lines.extend(f"• {blink(b, slack=True)}: {b['orphan_build_errors']:,} build error(s)"
+                         for b in orphan_builds)
         lines.append(format_excluded_old(rep, standalone))
         if standalone and rep["coverage"]:
             lines.append("• *Coverage:* " + " · ".join(
