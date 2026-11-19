@@ -67,7 +67,8 @@ Secrets tab, variables on the Variables tab).
 **Optional, not currently set.** If the CDash report has a Slack bot token and a
 channel it posts a richer report instead (a short summary in the channel, the
 details in a thread, and the full report as a file); without them it uses the
-webhook above:
+webhook above. The Slack summary shows each test group and the section total in
+an aligned, monospaced count table, including suites needing attention:
 
 | Name | Kind | What it is |
 | --- | --- | --- |

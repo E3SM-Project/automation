@@ -983,21 +983,22 @@ def suite_started_at(b):
     return datetime.fromtimestamp(b["started_at"], timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
-def format_header(rep, slack=False):
+def format_header(rep, slack=False, show_counts=True):
     total, nsuites = report_totals(rep)
     profile = rep.get("profile", PROFILE_ALL)
     title = "E3SM CDash EAMxx report" if profile == PROFILE_ALL else (
         f"E3SM CDash EAMxx {PROFILE_LABELS[profile]} report")
+    dashboard = (f"<{CDASH}/index.php?project={PROJECT}&date={rep['date']}|Dashboard> · "
+                 f"{nsuites} suites · {sum(total.values()):,} tests")
     return [f"*{title}: testing day {display(rep['date'], slack)}*",
-            f"<{CDASH}/index.php?project={PROJECT}&date={rep['date']}|Dashboard> · "
-             f"{nsuites} suites · {sum(total.values()):,} tests · {counts_str(total)}"]
+            dashboard + (f" · {counts_str(total)}" if show_counts else "")]
 
 
-def format_section_header(rep, standalone, slack=False):
+def format_section_header(rep, standalone, slack=False, show_counts=True):
     total, nsuites = section_totals(rep, standalone)
     label = "Standalone tests" if standalone else "CIME-based tests"
-    return [f"*{label}* · {nsuites} suites · {sum(total.values()):,} tests · "
-            f"{counts_str(total)}"]
+    return [f"*{label}* · {nsuites} suites · {sum(total.values()):,} tests" +
+            (f" · {counts_str(total)}" if show_counts else "")]
 
 
 def format_group_summary(rep, standalone, slack=False):
@@ -1020,6 +1021,37 @@ def format_group_summary(rep, standalone, slack=False):
             line += f" · _{problems} suite{'s' if problems != 1 else ''} need{'s' if problems == 1 else ''} attention_"
         lines.append(line)
     return lines
+
+
+def format_slack_table(rep, standalone):
+    """Align group counts in Slack, which does not render Markdown tables."""
+    headings = ("Group", "Suites", "FAIL", "BUILD FAIL", "DIFF", "PASS", "Not run", "Attention")
+    rows = []
+    groups = list(section_groups(rep, standalone))
+    if not any(builds or group["missing"] for group, builds in groups):
+        return ["• _No suites matched this report profile._"]
+    for group, builds in groups:
+        name = slack_escape(group["name"]).replace("`", "'").replace("\n", " ").replace("\r", " ")
+        if group["missing"]:
+            rows.append((name, "missing", *("—",) * 6))
+            continue
+        counts = sum((build["counts"] for build in builds), Counter())
+        rows.append((name, str(len(builds)), *(f"{counts[key]:,}" for key in
+                     ("FAIL", "BUILDFAIL", "DIFF", "PASS", "NOTRUN")),
+                     str(sum(has_problems(build) for build in builds))))
+    total, nsuites = section_totals(rep, standalone)
+    rows.append(("Total", str(nsuites), *(f"{total[key]:,}" for key in
+                 ("FAIL", "BUILDFAIL", "DIFF", "PASS", "NOTRUN")),
+                 str(sum(has_problems(build) for _, builds in groups
+                         for build in builds))))
+    widths = [max(len(row[index]) for row in [headings, *rows]) for index in range(len(headings))]
+
+    def line(row):
+        return "  ".join((value.ljust(widths[index]) if index == 0 else
+                          value.rjust(widths[index])) for index, value in enumerate(row))
+
+    return ["```", line(headings), line(tuple("-" * width for width in widths)),
+            *(line(row) for row in rows), "```"]
 
 
 def format_excluded_old(rep, standalone=None):
@@ -1126,10 +1158,10 @@ def format_markdown_report(rep):
 def format_slack_summary(rep, details_where):
     """A few lines for the channel: totals per category, coverage, and where the
     details are. details_where is a short mrkdwn phrase, or None."""
-    lines = format_header(rep, slack=True)
+    lines = format_header(rep, slack=True, show_counts=False)
     for label, standalone in report_sections(rep):
-        lines += format_section_header(rep, standalone, slack=True)
-        lines += format_group_summary(rep, standalone, slack=True)
+        lines += format_section_header(rep, standalone, slack=True, show_counts=False)
+        lines += format_slack_table(rep, standalone)
         lines.append(format_excluded_old(rep, standalone))
         if standalone and rep["coverage"]:
             lines.append("• *Coverage:* " + " · ".join(

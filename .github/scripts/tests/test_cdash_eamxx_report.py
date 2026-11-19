@@ -141,6 +141,45 @@ class SectionTests(unittest.TestCase):
 
 
 class FormattingTests(unittest.TestCase):
+    def test_slack_summary_aligns_counts_for_groups_and_totals(self):
+        def build(name, counts, orphan_build_errors=0):
+            return {"name": name, "counts": Counter(counts),
+                    "orphan_build_errors": orphan_build_errors}
+
+        rep = {"date": "2026-11-04", "profile": REPORT.PROFILE_CIME, "coverage": [],
+               "groups": [
+                   {"name": "E3SM_EAMXX", "missing": False, "excluded_old": 8,
+                    "builds": [build("cime-a", {"FAIL": 1, "PASS": 150, "NOTRUN": 8}),
+                               build("cime-b", {})]},
+                   {"name": "E3SM_MustPass_wBaselines", "missing": False,
+                    "builds": [build("cime-c", {"DIFF": 4, "PASS": 7}, 1)]},
+                   {"name": "E3SM_MustPass", "missing": True, "builds": []},
+               ]}
+
+        summary = REPORT.format_slack_summary(rep, "_Details in thread_")
+        self.assertEqual(summary.count("```"), 2)
+        self.assertNotIn(" · FAIL", summary)
+        table = summary.split("```")[1].strip("\n").splitlines()
+        self.assertEqual(len(table), 6)
+        self.assertEqual(table[0].split(),
+                         ["Group", "Suites", "FAIL", "BUILD", "FAIL", "DIFF", "PASS",
+                          "Not", "run", "Attention"])
+        self.assertEqual(table[2].split(), ["E3SM_EAMXX", "2", "1", "0", "0", "150", "8", "1"])
+        self.assertEqual(table[3].split(),
+                         ["E3SM_MustPass_wBaselines", "1", "0", "0", "4", "7", "0", "1"])
+        self.assertEqual(table[4].split(), ["E3SM_MustPass", "missing", "—", "—", "—", "—", "—", "—"])
+        self.assertEqual(table[5].split(), ["Total", "3", "1", "0", "4", "157", "8", "2"])
+        for column in ("Suites", "FAIL", "BUILD FAIL", "DIFF", "PASS", "Not run", "Attention"):
+            position = table[0].index(column) + len(column) - 1
+            self.assertTrue(all(row[position] != " " for row in table[2:]), column)
+        self.assertIn("Suites excluded as older than 18 hours:* 8", summary)
+        self.assertTrue(summary.endswith("_Details in thread_"))
+
+    def test_slack_summary_preserves_empty_profile_message(self):
+        rep = {"date": "2026-11-04", "profile": REPORT.PROFILE_UNIT, "coverage": [],
+               "groups": [{"name": "group", "missing": False, "builds": []}]}
+        self.assertIn("No suites matched this report profile", REPORT.format_slack_summary(rep, None))
+
     def test_coverage_uses_text_for_threshold_status(self):
         coverage = [{"buildid": "1", "site": "site", "buildname": "unit coverage",
                      "percentage": 80.0, "loctested": 8, "locuntested": 2}]
