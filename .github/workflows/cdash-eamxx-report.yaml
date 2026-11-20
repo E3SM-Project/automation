@@ -7,6 +7,8 @@ on:
     - cron: "0 18 * * 1-5"
     # Standalone/unit tests use an independent report and run.
     - cron: "30 18 * * 1-5"
+    # Coverage tests and percentage have their own report.
+    - cron: "0 19 * * 1-5"
   workflow_dispatch:
     inputs:
       profile:
@@ -16,6 +18,7 @@ on:
           - all
           - eamxx-cime
           - eamxx-unit
+          - eamxx-coverage
         default: all
         required: true
       date:
@@ -49,6 +52,7 @@ jobs:
             case "$SCHEDULE" in
               "0 18 * * 1-5") profile=eamxx-cime ;;
               "30 18 * * 1-5") profile=eamxx-unit ;;
+              "0 19 * * 1-5") profile=eamxx-coverage ;;
               *) echo "Unexpected CDash report schedule: $SCHEDULE" >&2; exit 1 ;;
             esac
           else

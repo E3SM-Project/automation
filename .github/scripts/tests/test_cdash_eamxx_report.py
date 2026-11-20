@@ -46,7 +46,7 @@ class CollectTests(unittest.TestCase):
                       " · Fix & clarify baselines",
                       REPORT.format_markdown_report(result))
 
-    def test_unit_build_error_without_failed_test_is_reported_separately(self):
+    def test_coverage_build_error_without_failed_test_is_reported_separately(self):
         build = {"id": "coverage-build", "site": "ghci-cuda",
                  "buildname": "scream_unit_tests_test_coverage", "builddatefull": 1_000_000,
                  "compilation": {"error": 1}}
@@ -64,7 +64,7 @@ class CollectTests(unittest.TestCase):
              patch.object(REPORT, "paged", side_effect=paged), \
              patch.object(REPORT, "triage_build_tests"), \
              patch.object(REPORT, "find_commit", return_value=None):
-            result = REPORT.collect("2026-11-19", now=1_000_000, profile=REPORT.PROFILE_UNIT)
+            result = REPORT.collect("2026-11-19", now=1_000_000, profile=REPORT.PROFILE_COVERAGE)
 
         suite = result["groups"][0]["builds"][0]
         self.assertEqual(suite["counts"], Counter({"PASS": 1}))
@@ -118,6 +118,10 @@ class CollectTests(unittest.TestCase):
             {"id": "cime", "site": "site", "buildname": "e3sm_eamxx_master", "builddatefull": 1_000_000},
             {"id": "unit", "site": "site", "buildname": "scream_unit_tests_release", "builddatefull": 1_000_000},
             {"id": "scripts", "site": "site", "buildname": "scripts_tests", "builddatefull": 1_000_000},
+            {"id": "coverage", "site": "site", "buildname": "scream_unit_tests_coverage",
+             "builddatefull": 1_000_000},
+            {"id": "test-coverage", "site": "site", "buildname": "scream_unit_tests_test_coverage",
+             "builddatefull": 1_000_000},
         ]
         tests = {build["id"]: [{"id": build["id"], "name": "eamxx", "status": "PASSED", "details": ""}]
                  for build in builds}
@@ -138,16 +142,42 @@ class CollectTests(unittest.TestCase):
             self.assertEqual(cime["coverage"], [])
             fetched.clear()
             unit = REPORT.collect("2026-11-04", now=1_000_000, profile=REPORT.PROFILE_UNIT)
+            self.assertEqual(fetched, ["unit", "scripts"])
+            self.assertEqual(unit["coverage"], [])
+            fetched.clear()
+            coverage = REPORT.collect("2026-11-04", now=1_000_000, profile=REPORT.PROFILE_COVERAGE)
 
-        self.assertEqual(fetched, ["unit", "scripts"])
+        self.assertEqual(fetched, ["coverage", "test-coverage"])
         self.assertEqual(unit["profile"], REPORT.PROFILE_UNIT)
-        self.assertEqual(unit["coverage"], index["coverages"])
+        self.assertEqual(coverage["profile"], REPORT.PROFILE_COVERAGE)
+        self.assertEqual(coverage["coverage"], index["coverages"])
+
+    def test_stale_coverage_suites_are_excluded_only_from_coverage_report(self):
+        cutoff = 1_000_000 - REPORT.MAX_SUITE_AGE_SECONDS
+        builds = [{"id": build_id, "site": "site", "buildname": name,
+                   "builddatefull": cutoff - 1} for build_id, name in (
+                       ("cime", "e3sm_eamxx_master"),
+                       ("unit", "scream_unit_tests_release"),
+                       ("coverage", "scream_unit_tests_coverage"))]
+        index = {"date": "2026-11-04", "buildgroups": [{"name": "group", "builds": builds}]}
+        with patch.object(REPORT, "GROUPS", {"group": "all"}), \
+             patch.object(REPORT, "http_json", return_value=index), \
+             patch.object(REPORT, "paged", return_value=[]):
+            report = REPORT.collect("2026-11-04", now=1_000_000)
+
+        group = report["groups"][0]
+        self.assertEqual(group["excluded_old"], 3)
+        for section in ("cime", "unit", "coverage"):
+            self.assertEqual(group[f"excluded_old_{section}"], 1)
+            self.assertIn("hours:* 1 (group: 1)", REPORT.format_excluded_old(report, section))
 
 
 class CliTests(unittest.TestCase):
     def test_profile_defaults_to_all(self):
         args = REPORT.make_parser().parse_args([])
         self.assertEqual(args.profile, REPORT.PROFILE_ALL)
+        self.assertEqual(REPORT.make_parser().parse_args(["--profile", "eamxx-coverage"]).profile,
+                         REPORT.PROFILE_COVERAGE)
 
 
 class SectionTests(unittest.TestCase):
@@ -155,6 +185,8 @@ class SectionTests(unittest.TestCase):
         self.assertTrue(REPORT.is_standalone_suite("scream_unit_tests_full_debug"))
         self.assertTrue(REPORT.is_standalone_suite("scripts_tests"))
         self.assertFalse(REPORT.is_standalone_suite("e3sm_eamxx_v1_master_gnugpu"))
+        self.assertEqual(REPORT.suite_section("scream_unit_tests_coverage"), "coverage")
+        self.assertEqual(REPORT.suite_section("scream_unit_tests_test_coverage"), "coverage")
 
     def test_report_separates_standalone_tests_and_coverage(self):
         rep = {"date": "2026-11-04", "coverage": [{
@@ -162,7 +194,7 @@ class SectionTests(unittest.TestCase):
             "percentage": 80.0, "loctested": 8, "locuntested": 2,
         }], "groups": [{
             "name": "group", "mode": "all", "missing": False, "excluded_old": 0,
-            "excluded_old_cime": 0, "excluded_old_standalone": 0,
+            "excluded_old_cime": 0, "excluded_old_unit": 0, "excluded_old_coverage": 0,
             "builds": [
                 {"id": "cime", "site": "site", "name": "e3sm_master", "tests": [],
                  "counts": Counter({"PASS": 3}), "orphan_build_errors": 0, "commit": None},
@@ -170,6 +202,8 @@ class SectionTests(unittest.TestCase):
                  "counts": Counter({"PASS": 6000}), "orphan_build_errors": 0, "commit": None},
                 {"id": "scripts", "site": "site", "name": "scripts_tests", "tests": [],
                  "counts": Counter({"PASS": 2}), "orphan_build_errors": 0, "commit": None},
+                {"id": "coverage", "site": "site", "name": "scream_unit_tests_coverage", "tests": [],
+                 "counts": Counter({"PASS": 5}), "orphan_build_errors": 0, "commit": None},
             ],
         }]}
 
@@ -181,25 +215,37 @@ class SectionTests(unittest.TestCase):
         self.assertLess(report.index("CIME-based tests"), report.index("Standalone tests"))
         self.assertIn("CIME-based tests* · 1 suites · 3 tests", report)
         self.assertIn("Standalone tests* · 2 suites · 6,002 tests", report)
-        self.assertIn("Coverage", report)
+        self.assertIn("Coverage tests* · 1 suites · 5 tests", report)
         self.assertIn("### CIME-based tests", markdown)
         self.assertIn("### Standalone tests", markdown)
+        self.assertIn("### Coverage tests", markdown)
         self.assertIn("| group | 1 | 0 | 0 | 0 | 3 | 0 | 0 |", markdown)
         self.assertIn("| group | 2 | 0 | 0 | 0 | 6,002 | 0 | 0 |", markdown)
-        self.assertEqual(summary.count("Coverage"), 1)
+        self.assertIn("| group | 1 | 0 | 0 | 0 | 5 | 0 | 0 |", markdown)
+        self.assertIn("80.0% (below target of 90%)", summary)
         self.assertIn("CIME-based tests", thread)
         self.assertIn("Standalone tests", thread)
+        self.assertIn("Coverage tests", thread)
 
         cime_report = {**rep, "profile": REPORT.PROFILE_CIME}
         unit_report = {**rep, "profile": REPORT.PROFILE_UNIT}
+        coverage_report = {**rep, "profile": REPORT.PROFILE_COVERAGE}
         cime_text = REPORT.format_report(cime_report)
         unit_text = REPORT.format_report(unit_report)
+        coverage_text = REPORT.format_report(coverage_report)
         self.assertIn("CIME-based tests", cime_text)
         self.assertNotIn("Standalone tests", cime_text)
         self.assertNotIn("Coverage", cime_text)
         self.assertIn("Standalone tests", unit_text)
         self.assertNotIn("CIME-based tests", unit_text)
-        self.assertIn("Coverage", unit_text)
+        self.assertNotIn("Coverage tests", unit_text)
+        self.assertNotIn("scream_unit_tests_coverage", unit_text)
+        self.assertIn("Coverage tests", coverage_text)
+        self.assertNotIn("Standalone tests", coverage_text)
+        self.assertNotIn("• *Coverage:*", REPORT.format_slack_summary(unit_report, None))
+        self.assertIn("• *Coverage:*", REPORT.format_slack_summary(coverage_report, None))
+        self.assertNotIn("### Coverage tests", REPORT.format_markdown_report(unit_report))
+        self.assertIn("### Coverage tests", REPORT.format_markdown_report(coverage_report))
         empty_unit = {"date": "2026-11-04", "profile": REPORT.PROFILE_UNIT, "coverage": [],
                       "groups": [{"name": "group", "missing": False, "builds": []}]}
         self.assertIn("No suites matched this report profile", REPORT.format_report(empty_unit))
@@ -289,10 +335,13 @@ class FormattingTests(unittest.TestCase):
         coverage = [{"buildid": "1", "site": "site", "buildname": "unit coverage",
                      "percentage": 80.0, "loctested": 8, "locuntested": 2}]
         rendered = "\n".join(REPORT.format_coverage(coverage))
-        self.assertIn("80.00%* (meets target of 70%)", rendered)
+        self.assertIn("80.00%* (below target of 90%)", rendered)
         self.assertNotIn("🟢", rendered)
-        self.assertEqual(REPORT.coverage_status({"percentage": 60}), "warning band above 49%")
-        self.assertEqual(REPORT.coverage_status({"percentage": 40}), "below minimum of 49%")
+        self.assertEqual(REPORT.coverage_status({"percentage": 90, "thresholdgreen": 70}),
+                         "meets target of 90%")
+        self.assertEqual(REPORT.coverage_status({"percentage": 89.9}), "below target of 90%")
+        self.assertEqual(REPORT.coverage_status({"percentage": 60}), "below target of 90%")
+        self.assertEqual(REPORT.coverage_status({"percentage": 40}), "below minimum of 49% (target 90%)")
 
     def test_compact_output_omits_passing_suite_rows_but_keeps_failures(self):
         rep = {"date": "2026-11-04", "coverage": [], "groups": [{

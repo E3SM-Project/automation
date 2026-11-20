@@ -85,15 +85,20 @@ NAME_FILTER = "eamxx"
 PROFILE_ALL = "all"
 PROFILE_CIME = "eamxx-cime"
 PROFILE_UNIT = "eamxx-unit"
-PROFILES = (PROFILE_ALL, PROFILE_CIME, PROFILE_UNIT)
-REPORT_SECTIONS = (("CIME-based tests", False), ("Standalone tests", True))
+PROFILE_COVERAGE = "eamxx-coverage"
+PROFILES = (PROFILE_ALL, PROFILE_CIME, PROFILE_UNIT, PROFILE_COVERAGE)
+REPORT_SECTIONS = (("CIME-based tests", "cime"), ("Standalone tests", "unit"),
+                   ("Coverage tests", "coverage"))
+SECTION_PROFILES = {"cime": PROFILE_CIME, "unit": PROFILE_UNIT, "coverage": PROFILE_COVERAGE}
 PROFILE_LABELS = {
     PROFILE_ALL: "combined",
     PROFILE_CIME: "CIME",
     PROFILE_UNIT: "unit",
+    PROFILE_COVERAGE: "coverage",
 }
 MAX_SUITE_AGE_HOURS = 18
 MAX_SUITE_AGE_SECONDS = MAX_SUITE_AGE_HOURS * 60 * 60
+COVERAGE_TARGET_PERCENT = 90
 
 BLESS_RE = re.compile(r"Most recent bless:\s*sha:(\S+)\s+date:(\S+)")
 MERGE_PR_RE = re.compile(r"^Merge pull request #(\d+)\b")
@@ -222,7 +227,7 @@ def collect(date, now=None, profile=PROFILE_ALL):
     url = f"{CDASH}/api/v1/index.php?project={PROJECT}" + (f"&date={date}" if date else "")
     index = http_json(url)
     report = {"date": index.get("date"), "profile": profile, "groups": [],
-              "coverage": collect_coverage(index) if profile != PROFILE_CIME else []}
+              "coverage": collect_coverage(index) if profile in (PROFILE_ALL, PROFILE_COVERAGE) else []}
     cutoff = (time.time() if now is None else now) - MAX_SUITE_AGE_SECONDS
     by_name = {g["name"]: g for g in index.get("buildgroups", [])}
 
@@ -231,7 +236,8 @@ def collect(date, now=None, profile=PROFILE_ALL):
     for gname, mode in GROUPS.items():
         g = by_name.get(gname)
         group = {"name": gname, "mode": mode, "builds": [], "missing": g is None,
-                 "excluded_old": 0, "excluded_old_cime": 0, "excluded_old_standalone": 0}
+                 "excluded_old": 0, "excluded_old_cime": 0, "excluded_old_unit": 0,
+                 "excluded_old_coverage": 0}
         for b in (g or {}).get("builds", []):
             if not suite_matches_profile(b["buildname"], profile):
                 continue
@@ -247,7 +253,7 @@ def collect(date, now=None, profile=PROFILE_ALL):
                 started_at = None  # keep suites CDash did not timestamp
             if started_at is not None and started_at < cutoff:
                 group["excluded_old"] += 1
-                key = "excluded_old_standalone" if is_standalone_suite(b["buildname"]) else "excluded_old_cime"
+                key = "excluded_old_" + suite_section(b["buildname"])
                 group[key] += 1
                 continue
 
@@ -352,9 +358,8 @@ def collect_coverage(index):
             continue
         seen.add(c["buildid"])
         out.append(c)
-    green, yellow = index.get("thresholdgreen", 70), index.get("thresholdyellow", 49)
+    yellow = index.get("thresholdyellow", 49)
     for c in out:
-        c["thresholdgreen"] = green
         c["thresholdyellow"] = yellow
     return out
 
@@ -947,7 +952,7 @@ def evidence_link():
 
 
 def format_coverage(cov, slack=False):
-    lines = ["*Coverage* (unit tests)"]
+    lines = ["*Coverage*"]
     if not cov:
         return lines + ["    _no coverage results today_"]
     for c in cov:
@@ -965,15 +970,14 @@ def format_coverage(cov, slack=False):
 
 
 def coverage_status(coverage):
-    """Describe CDash coverage thresholds without relying on color or icons."""
+    """Describe the report's 90% target and CDash warning threshold without icons."""
     percentage = coverage["percentage"]
-    green = coverage.get("thresholdgreen", 70)
     yellow = coverage.get("thresholdyellow", 49)
-    if percentage >= green:
-        return f"meets target of {green:g}%"
+    if percentage >= COVERAGE_TARGET_PERCENT:
+        return f"meets target of {COVERAGE_TARGET_PERCENT:g}%"
     if percentage >= yellow:
-        return f"warning band above {yellow:g}%"
-    return f"below minimum of {yellow:g}%"
+        return f"below target of {COVERAGE_TARGET_PERCENT:g}%"
+    return f"below minimum of {yellow:g}% (target {COVERAGE_TARGET_PERCENT:g}%)"
 
 
 def is_standalone_suite(name):
@@ -982,26 +986,33 @@ def is_standalone_suite(name):
     return "unit_tests" in name or "scripts_tests" in name
 
 
+def suite_section(name):
+    name = name.lower()
+    if "unit_tests_coverage" in name or "unit_tests_test_coverage" in name:
+        return "coverage"
+    return "unit" if is_standalone_suite(name) else "cime"
+
+
 def suite_matches_profile(name, profile):
     """Whether a build suite belongs in the requested report profile."""
     if profile == PROFILE_ALL:
         return True
-    return is_standalone_suite(name) == (profile == PROFILE_UNIT)
+    return SECTION_PROFILES[suite_section(name)] == profile
 
 
-def section_groups(rep, standalone):
+def section_groups(rep, section):
     """Yield (group, builds) for one report section."""
+    show_missing = section == "cime" or rep.get("profile") == SECTION_PROFILES[section]
     for group in rep["groups"]:
-        builds = [b for b in group["builds"] if is_standalone_suite(b["name"]) == standalone]
-        if builds or (group["missing"] and
-                      (not standalone or rep.get("profile", PROFILE_ALL) == PROFILE_UNIT)):
+        builds = [b for b in group["builds"] if suite_section(b["name"]) == section]
+        if builds or (group["missing"] and show_missing):
             yield group, builds
 
 
-def section_totals(rep, standalone):
+def section_totals(rep, section):
     total = Counter()
     nsuites = 0
-    for _, builds in section_groups(rep, standalone):
+    for _, builds in section_groups(rep, section):
         for build in builds:
             total += build["counts"]
             nsuites += 1
@@ -1017,6 +1028,8 @@ def report_sections(rep):
         return (REPORT_SECTIONS[0],)
     if profile == PROFILE_UNIT:
         return (REPORT_SECTIONS[1],)
+    if profile == PROFILE_COVERAGE:
+        return (REPORT_SECTIONS[2],)
     raise ValueError(f"unknown report profile: {profile}")
 
 
@@ -1058,19 +1071,19 @@ def format_header(rep, slack=False, show_counts=True):
             (f" · build errors {build_errors:,}" if show_counts and build_errors else "")]
 
 
-def format_section_header(rep, standalone, slack=False, show_counts=True):
-    total, nsuites = section_totals(rep, standalone)
-    build_errors = build_error_total(b for _, builds in section_groups(rep, standalone) for b in builds)
-    label = "Standalone tests" if standalone else "CIME-based tests"
+def format_section_header(rep, section, slack=False, show_counts=True):
+    total, nsuites = section_totals(rep, section)
+    build_errors = build_error_total(b for _, builds in section_groups(rep, section) for b in builds)
+    label = next(label for label, kind in REPORT_SECTIONS if kind == section)
     return [f"*{label}* · {nsuites} suites · {sum(total.values()):,} tests" +
             (f" · {counts_str(total)}" if show_counts else "") +
             (f" · build errors {build_errors:,}" if show_counts and build_errors else "")]
 
 
-def format_group_summary(rep, standalone, slack=False):
+def format_group_summary(rep, section, slack=False):
     """One aggregate line per test group, without listing individual suites."""
     lines = []
-    groups = list(section_groups(rep, standalone))
+    groups = list(section_groups(rep, section))
     if not any(builds for _, builds in groups):
         if not any(g["missing"] for g, _ in groups):
             return ["• _No suites matched this report profile._"]
@@ -1092,12 +1105,12 @@ def format_group_summary(rep, standalone, slack=False):
     return lines
 
 
-def format_slack_table(rep, standalone):
+def format_slack_table(rep, section):
     """Align group counts in Slack, which does not render Markdown tables."""
     headings = ("Group", "Suites", "FAIL", "BUILD FAIL", "DIFF", "PASS", "Not run",
                 "Build errors", "Attention")
     rows = []
-    groups = list(section_groups(rep, standalone))
+    groups = list(section_groups(rep, section))
     if not any(builds or group["missing"] for group, builds in groups):
         return ["• _No suites matched this report profile._"]
     for group, builds in groups:
@@ -1110,7 +1123,7 @@ def format_slack_table(rep, standalone):
                      ("FAIL", "BUILDFAIL", "DIFF", "PASS", "NOTRUN")),
                      f"{build_error_total(builds):,}",
                      str(sum(has_problems(build) for build in builds))))
-    total, nsuites = section_totals(rep, standalone)
+    total, nsuites = section_totals(rep, section)
     rows.append(("Total", str(nsuites), *(f"{total[key]:,}" for key in
                  ("FAIL", "BUILDFAIL", "DIFF", "PASS", "NOTRUN")),
                  f"{build_error_total(build for _, builds in groups for build in builds):,}",
@@ -1126,16 +1139,16 @@ def format_slack_table(rep, standalone):
             *(line(row) for row in rows), "```"]
 
 
-def format_excluded_old(rep, standalone=None):
+def format_excluded_old(rep, section=None):
     """Briefly report suites skipped because their CDash build start is stale."""
-    if standalone is None:
+    if section is None:
         key = "excluded_old"
     else:
-        key = "excluded_old_standalone" if standalone else "excluded_old_cime"
+        key = "excluded_old_" + section
     def count(group):
         # The fallback keeps formatting fixtures and reports created before the
         # section split compatible with the new renderer.
-        return group.get(key, group.get("excluded_old", 0) if standalone is False else 0)
+        return group.get(key, group.get("excluded_old", 0) if section == "cime" else 0)
 
     total = sum(count(g) for g in rep["groups"])
     by_group = " · ".join(f"{g['name']}: {count(g)}" for g in rep["groups"] if count(g))
@@ -1144,13 +1157,13 @@ def format_excluded_old(rep, standalone=None):
             f"{total} ({detail})")
 
 
-def format_details(rep, evidence_note=None, slack=False, standalone=None):
+def format_details(rep, evidence_note=None, slack=False, section=None):
     """FAILs, BUILD FAILs and DIFFs, suite by suite."""
     lines = []
-    if standalone is None:
+    if section is None:
         groups = [(g, g["builds"]) for g in rep["groups"]]
     else:
-        groups = list(section_groups(rep, standalone))
+        groups = list(section_groups(rep, section))
     problems = [(g, b) for g, builds in groups for b in builds if has_problems(b)]
     lines.append("*Details: FAILs, BUILD FAILs and DIFFs*" if problems
                  else "*No FAILs, BUILD FAILs or DIFFs*")
@@ -1185,13 +1198,13 @@ def format_details(rep, evidence_note=None, slack=False, standalone=None):
 def format_report(rep, slack=False):
     """Compact report for all tests or one selected profile."""
     lines = format_header(rep, slack) + [""]
-    for label, standalone in report_sections(rep):
-        lines += format_section_header(rep, standalone, slack)
-        lines += format_group_summary(rep, standalone, slack)
-        lines += [format_excluded_old(rep, standalone)]
-        if standalone:
+    for label, section in report_sections(rep):
+        lines += format_section_header(rep, section, slack)
+        lines += format_group_summary(rep, section, slack)
+        lines += [format_excluded_old(rep, section)]
+        if section == "coverage":
             lines += format_coverage(rep["coverage"], slack)
-        lines += [""] + format_details(rep, slack=slack, standalone=standalone) + [""]
+        lines += [""] + format_details(rep, slack=slack, section=section) + [""]
     return "\n".join(lines).rstrip()
 
 
@@ -1204,11 +1217,11 @@ def format_markdown_report(rep):
         f"{nsuites} suites · {sum(total.values()):,} tests",
         "",
     ]
-    for label, standalone in report_sections(rep):
-        total, nsuites = section_totals(rep, standalone)
+    for label, section in report_sections(rep):
+        total, nsuites = section_totals(rep, section)
         lines += [f"### {label}", "", "| Group | Suites | FAIL | BUILD FAIL | DIFF | PASS | Not run | Build errors |",
                   "|---|---:|---:|---:|---:|---:|---:|---:|"]
-        for g, builds in section_groups(rep, standalone):
+        for g, builds in section_groups(rep, section):
             if g["missing"]:
                 lines.append(f"| {g['name']} | — | — | — | — | — | — | — |")
                 continue
@@ -1219,13 +1232,13 @@ def format_markdown_report(rep):
         lines.append(f"| **Total** | **{nsuites}** | **{total['FAIL']:,}** | "
                      f"**{total['BUILDFAIL']:,}** | **{total['DIFF']:,}** | **{total['PASS']:,}** | "
                      f"**{total['NOTRUN']:,}** | "
-                     f"**{build_error_total(b for _, builds in section_groups(rep, standalone) for b in builds):,}** |")
-        if build_error_total(b for _, builds in section_groups(rep, standalone) for b in builds):
+                     f"**{build_error_total(b for _, builds in section_groups(rep, section) for b in builds):,}** |")
+        if build_error_total(b for _, builds in section_groups(rep, section) for b in builds):
             lines += ["", "Build errors are not tied to a test and are not included in the test counts."]
-        lines += ["", format_excluded_old(rep, standalone)]
-        if standalone:
+        lines += ["", format_excluded_old(rep, section)]
+        if section == "coverage":
             lines += [""] + to_markdown("\n".join(format_coverage(rep["coverage"], slack=False)), title=False).splitlines()
-        lines += [""] + to_markdown("\n".join(format_details(rep, standalone=standalone)), title=False).splitlines()
+        lines += [""] + to_markdown("\n".join(format_details(rep, section=section)), title=False).splitlines()
         lines.append("")
     return "\n".join(lines) + "\n"
 
@@ -1234,17 +1247,17 @@ def format_slack_summary(rep, details_where):
     """A few lines for the channel: totals per category, coverage, and where the
     details are. details_where is a short mrkdwn phrase, or None."""
     lines = format_header(rep, slack=True, show_counts=False)
-    for label, standalone in report_sections(rep):
-        lines += format_section_header(rep, standalone, slack=True, show_counts=False)
-        lines += format_slack_table(rep, standalone)
-        orphan_builds = [b for _, builds in section_groups(rep, standalone) for b in builds
+    for label, section in report_sections(rep):
+        lines += format_section_header(rep, section, slack=True, show_counts=False)
+        lines += format_slack_table(rep, section)
+        orphan_builds = [b for _, builds in section_groups(rep, section) for b in builds
                          if b["orphan_build_errors"]]
         if orphan_builds:
             lines.append("_Build errors are not tied to a test and are not included in the test counts._")
             lines.extend(f"• {blink(b, slack=True)}: {b['orphan_build_errors']:,} build error(s)"
                          for b in orphan_builds)
-        lines.append(format_excluded_old(rep, standalone))
-        if standalone and rep["coverage"]:
+        lines.append(format_excluded_old(rep, section))
+        if section == "coverage" and rep["coverage"]:
             lines.append("• *Coverage:* " + " · ".join(
                 f"{slack_escape(c['site'])} {c['percentage']:.1f}% ({coverage_status(c)})"
                 for c in rep["coverage"]))
@@ -1258,9 +1271,9 @@ def format_thread(rep, with_file):
     note = ("_Log excerpts behind each likely cause are in the report file below._" if with_file
             else None)
     lines = []
-    for label, standalone in report_sections(rep):
-        lines += format_section_header(rep, standalone, slack=True)
-        lines += format_details(rep, note, slack=True, standalone=standalone)
+    for label, section in report_sections(rep):
+        lines += format_section_header(rep, section, slack=True)
+        lines += format_details(rep, note, slack=True, section=section)
         lines.append("")
     return "\n".join(lines).rstrip()
 
