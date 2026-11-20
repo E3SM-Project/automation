@@ -30,24 +30,27 @@ dot (`.github` is taken).
 
 | Workflow | Schedule | What it does |
 | --- | --- | --- |
-| `cdash-eamxx-report.yaml` | weekdays, 18:00 UTC (CIME) and 18:30 UTC (unit) | Posts separate CIME and standalone EAMxx CDash reports to Slack |
+| `cdash-eamxx-report.yaml` | weekdays, 18:00 UTC (CIME), 18:30 UTC (unit), and 19:00 UTC (coverage) | Posts separate CIME, standalone, and coverage EAMxx CDash reports to Slack |
 | `gh-ai-usage-report.yaml` | daily, 08:00 UTC | Reports the organization's GitHub AI credit usage to Slack |
 
 Both can also be run manually from the Actions tab (`workflow_dispatch`), with a
 `dry_run` option that only writes the job summary and doesn't post to Slack. The
-CDash workflow lets you choose `all` (the default), `eamxx-cime`, or `eamxx-unit`,
-and optionally a testing date. Its scheduled runs select the CIME and unit profiles
-independently. If a scheduled run fails, both workflows post a failure alert to
-Slack. The AI-usage workflow also runs as a dry run on PRs that touch it or its
-script.
+CDash workflow lets you choose `all` (the default), `eamxx-cime`, `eamxx-unit`, or
+`eamxx-coverage`, and optionally a testing date. Its scheduled runs select the
+three profiles independently. The coverage report contains the
+`scream_unit_tests_coverage` suite and its coverage measurements, with a 90%
+target; the unit report excludes coverage suites and measurements. If a
+scheduled run fails, both workflows post a failure alert to Slack. The AI-usage
+workflow also runs as a dry run on PRs that touch it or its script.
 
 The CDash report can also be run locally. With no `--profile`, it reports both
-CIME-based and standalone tests as before:
+CIME-based, standalone, and coverage tests:
 
 ```bash
 python .github/scripts/cdash_eamxx_report.py --dry-run
 python .github/scripts/cdash_eamxx_report.py --profile eamxx-cime --dry-run
 python .github/scripts/cdash_eamxx_report.py --profile eamxx-unit --date 2026-11-04 --dry-run
+python .github/scripts/cdash_eamxx_report.py --profile eamxx-coverage --dry-run
 ```
 
 ## Secrets and variables
@@ -67,7 +70,18 @@ Secrets tab, variables on the Variables tab).
 **Optional, not currently set.** If the CDash report has a Slack bot token and a
 channel it posts a richer report instead (a short summary in the channel, the
 details in a thread, and the full report as a file); without them it uses the
-webhook above:
+webhook above. The Slack summary shows each test group and the section total in
+an aligned, monospaced count table, including suites needing attention. Build
+errors without a failed test are counted separately and have a build-error link
+in the details; they are not included in the test counts. Suite names in the
+details link to CDash's failed-test list only when tests failed.
+
+For baseline DIFFs, the report links to the E3SM merge PR and shows its title
+when the bless SHA's commit headline identifies one; otherwise it links to the
+commit SHA. GitHub lookups are cached per report. Local runs can omit
+`GITHUB_TOKEN`; unavailable lookups fall back to the commit link or PR number.
+
+Slack bot settings:
 
 | Name | Kind | What it is |
 | --- | --- | --- |
