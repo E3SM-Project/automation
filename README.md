@@ -72,8 +72,9 @@ channel it posts a richer report instead (a short summary in the channel, the
 details in a thread, and the full report as a file); without them it uses the
 webhook above. The Slack summary shows each test group and the section total in
 an aligned, monospaced count table, including suites needing attention. Build
-errors without a failed test are counted separately and link to the affected
-suite; they are not included in the test counts.
+errors without a failed test are counted separately and have a build-error link
+in the details; they are not included in the test counts. Suite names in the
+details link to CDash's failed-test list only when tests failed.
 
 For baseline DIFFs, the report links to the E3SM merge PR and shows its title
 when the bless SHA's commit headline identifies one; otherwise it links to the

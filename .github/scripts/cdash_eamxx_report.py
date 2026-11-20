@@ -821,8 +821,12 @@ def display(value, slack):
 
 
 def blink(b, slack=False):
-    return (f"<{CDASH}/builds/{b['id']}|{display(b['site'], slack)} / "
-            f"{display(b['name'], slack)}>")
+    label = f"{display(b['site'], slack)} / {display(b['name'], slack)}"
+    if not any(t["bucket"] in ("FAIL", "BUILDFAIL", "DIFF") for t in b.get("tests", [])):
+        return label
+    filters = urllib.parse.quote(json.dumps({"all": [{"eq": {"status": "FAILED"}}]},
+                                          separators=(",", ":")), safe="")
+    return f"<{CDASH}/builds/{b['id']}/tests?filters={filters}|{label}>"
 
 
 def tlink(t, slack=False):

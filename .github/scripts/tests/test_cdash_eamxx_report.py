@@ -254,6 +254,46 @@ class SectionTests(unittest.TestCase):
 
 
 class FormattingTests(unittest.TestCase):
+    def test_suite_links_show_failed_test_list_only_when_tests_failed(self):
+        filters = "%7B%22all%22%3A%5B%7B%22eq%22%3A%7B%22status%22%3A%22FAILED%22%7D%7D%5D%7D"
+        builds = []
+        for bucket in ("FAIL", "BUILDFAIL", "DIFF"):
+            build = {"id": bucket, "site": "site", "name": f"eamxx_{bucket}", "commit": None,
+                     "orphan_build_errors": 1 if bucket == "FAIL" else 0,
+                     "counts": Counter({bucket: 1}), "tests": [{
+                         "id": bucket, "name": f"test-{bucket}", "bucket": bucket,
+                         "diff_diagnostics": [], "bless": None,
+                     }]}
+            builds.append(build)
+            self.assertEqual(REPORT.blink(build),
+                             f"<https://my.cdash.org/builds/{bucket}/tests?filters={filters}|"
+                             f"site / eamxx_{bucket}>")
+        orphan = {"id": "orphan", "site": "site", "name": "orphan-build", "commit": None,
+                  "orphan_build_errors": 1, "counts": Counter({"PASS": 1}),
+                  "tests": [{"bucket": "PASS"}]}
+        self.assertEqual(REPORT.blink(orphan), "site / orphan-build")
+        self.assertEqual(REPORT.blink({**orphan, "tests": [{"bucket": "NOTRUN"}]}),
+                         "site / orphan-build")
+
+        rep = {"date": "2026-11-20", "profile": REPORT.PROFILE_CIME, "coverage": [],
+               "groups": [{"name": "group", "missing": False, "builds": [*builds, orphan]}]}
+        full = REPORT.format_report(rep)
+        thread = REPORT.format_thread(rep, with_file=False)
+        markdown = REPORT.format_markdown_report(rep)
+        summary = REPORT.format_slack_summary(rep, None)
+        for bucket in ("FAIL", "BUILDFAIL", "DIFF"):
+            url = f"https://my.cdash.org/builds/{bucket}/tests?filters={filters}"
+            self.assertIn(f"<{url}|site / eamxx_{bucket}>", full)
+            self.assertIn(f"<{url}|site / eamxx_{bucket}>", thread)
+            self.assertIn(f"[site / eamxx_{bucket}]({url})", markdown)
+        self.assertIn("*group* · site / orphan-build", full)
+        self.assertIn("*group* · site / orphan-build", thread)
+        self.assertIn("[build errors](https://my.cdash.org/builds/orphan/build)", markdown)
+        self.assertIn("• site / orphan-build: 1 build error(s)", summary)
+        self.assertIn(f"<https://my.cdash.org/builds/FAIL/tests?filters={filters}|"
+                      "site / eamxx_FAIL>", summary)
+        self.assertNotIn("/builds/orphan|", full + thread + summary)
+
     def test_merge_pr_lookup_parses_only_commit_headline_and_falls_back(self):
         with patch.dict(REPORT.os.environ, {"GITHUB_TOKEN": "test-token"}), \
              patch.object(REPORT.urllib.request, "urlopen") as urlopen:
