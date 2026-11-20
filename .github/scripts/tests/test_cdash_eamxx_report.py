@@ -1,6 +1,8 @@
 import importlib.util
+import io
 import pathlib
 import unittest
+import urllib.error
 from collections import Counter
 from unittest.mock import patch
 
@@ -12,6 +14,38 @@ SPEC.loader.exec_module(REPORT)
 
 
 class CollectTests(unittest.TestCase):
+    def test_baseline_merge_pr_is_looked_up_once_across_suites(self):
+        sha = "5b1427fe20eb1234"
+        builds = [{"id": build_id, "site": "site", "buildname": f"eamxx_{build_id}",
+                   "builddatefull": 1_000_000} for build_id in ("one", "two")]
+        index = {"date": "2026-11-19", "buildgroups": [{"name": "E3SM_EAMXX", "builds": builds}]}
+
+        def paged(query, build_id, field, variables=None):
+            if query is REPORT.TESTS_Q:
+                return [{"id": build_id, "name": "eamxx-test", "status": "FAILED",
+                         "details": "Completed (DIFF)"}]
+            self.assertIs(query, REPORT.FAILED_LOGS_Q)
+            return [{"id": build_id, "output": f"Most recent bless: sha:{sha} date:2026-11-18_12:00:00"}]
+
+        with patch.object(REPORT, "GROUPS", {"E3SM_EAMXX": "all"}), \
+             patch.object(REPORT, "http_json", return_value=index), \
+             patch.object(REPORT, "paged", side_effect=paged), \
+             patch.object(REPORT, "lookup_merge_pr", return_value="1234") as lookup, \
+             patch.object(REPORT, "lookup_pr_title", return_value="Fix & clarify baselines") as title_lookup, \
+             patch.object(REPORT, "triage_build_tests"), \
+             patch.object(REPORT, "find_commit", return_value=None):
+            result = REPORT.collect("2026-11-19", now=1_000_000, profile=REPORT.PROFILE_CIME)
+
+        lookup.assert_called_once_with(sha)
+        title_lookup.assert_called_once_with("1234")
+        self.assertEqual([b["tests"][0]["baseline_pr"] for b in result["groups"][0]["builds"]],
+                         ["1234", "1234"])
+        self.assertIn("Merge PR #1234> · Fix &amp; clarify baselines",
+                      REPORT.format_report(result, slack=True))
+        self.assertIn("[Merge PR #1234](https://github.com/E3SM-Project/E3SM/pull/1234)"
+                      " · Fix & clarify baselines",
+                      REPORT.format_markdown_report(result))
+
     def test_unit_build_error_without_failed_test_is_reported_separately(self):
         build = {"id": "coverage-build", "site": "ghci-cuda",
                  "buildname": "scream_unit_tests_test_coverage", "builddatefull": 1_000_000,
@@ -174,6 +208,44 @@ class SectionTests(unittest.TestCase):
 
 
 class FormattingTests(unittest.TestCase):
+    def test_merge_pr_lookup_parses_only_commit_headline_and_falls_back(self):
+        with patch.dict(REPORT.os.environ, {"GITHUB_TOKEN": "test-token"}), \
+             patch.object(REPORT.urllib.request, "urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value = io.BytesIO(
+                b'{"commit": {"message": "Merge pull request #1234 from branch\\n\\nDetails"}}')
+            self.assertEqual(REPORT.lookup_merge_pr("5b1427fe20eb1234"), "1234")
+            request = urlopen.call_args.args[0]
+            self.assertEqual(request.full_url,
+                             "https://api.github.com/repos/E3SM-Project/E3SM/commits/5b1427fe20eb1234")
+            self.assertEqual(request.get_header("Authorization"), "Bearer test-token")
+            self.assertEqual(urlopen.call_args.kwargs["timeout"], 10)
+
+            urlopen.return_value.__enter__.return_value = io.BytesIO(
+                b'{"commit": {"message": "Update model\\n\\nMerge pull request #1234"}}')
+            self.assertIsNone(REPORT.lookup_merge_pr("5b1427fe20eb1234"))
+            urlopen.side_effect = urllib.error.HTTPError(request.full_url, 403, "rate limited", {}, None)
+            self.assertIsNone(REPORT.lookup_merge_pr("5b1427fe20eb1234"))
+            urlopen.reset_mock()
+            self.assertIsNone(REPORT.lookup_merge_pr("not-a-sha"))
+            urlopen.assert_not_called()
+
+    def test_pr_title_lookup_collapses_lines_and_falls_back_on_errors(self):
+        with patch.dict(REPORT.os.environ, {"GITHUB_TOKEN": "test-token"}), \
+             patch.object(REPORT.urllib.request, "urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value = io.BytesIO(
+                b'{"title": "Fix baseline tests  \\n for EAMxx"}')
+            self.assertEqual(REPORT.lookup_pr_title("1234"), "Fix baseline tests for EAMxx")
+            request = urlopen.call_args.args[0]
+            self.assertEqual(request.full_url, "https://api.github.com/repos/E3SM-Project/E3SM/pulls/1234")
+            self.assertEqual(request.get_header("Authorization"), "Bearer test-token")
+            self.assertEqual(urlopen.call_args.kwargs["timeout"], 10)
+
+            urlopen.side_effect = urllib.error.HTTPError(request.full_url, 404, "not found", {}, None)
+            self.assertIsNone(REPORT.lookup_pr_title("1234"))
+            urlopen.side_effect = None
+            urlopen.return_value.__enter__.return_value = io.BytesIO(b'{"title": "  "}')
+            self.assertIsNone(REPORT.lookup_pr_title("1234"))
+
     def test_slack_summary_aligns_counts_for_groups_and_totals(self):
         def build(name, counts, orphan_build_errors=0):
             return {"id": name, "site": "site", "name": name, "counts": Counter(counts),
@@ -302,6 +374,16 @@ class FormattingTests(unittest.TestCase):
         markdown = REPORT.to_markdown(tallies, title=False)
         self.assertIn("[`5b1427fe20eb`](https://github.com/E3SM-Project/E3SM/commit/"
                       "5b1427fe20eb1234)", markdown)
+        diffs[0]["baseline_pr"] = "1234"
+        diffs[0]["baseline_pr_title"] = "Fix & clarify <baselines>"
+        pr_tallies = "\n".join(REPORT.format_diff_tallies(diffs, slack=True))
+        self.assertIn("Merge PR #1234", pr_tallies)
+        self.assertIn("<https://github.com/E3SM-Project/E3SM/pull/1234|Merge PR #1234>", pr_tallies)
+        self.assertIn("Merge PR #1234> · Fix &amp; clarify &lt;baselines&gt; · blessed", pr_tallies)
+        diffs[0]["baseline_pr_title"] = None
+        self.assertNotIn("None", "\n".join(REPORT.format_diff_tallies(diffs, slack=True)))
+        self.assertIn("sha <https://github.com/E3SM-Project/E3SM/commit/ca0b1c1b1da1234|",
+                      pr_tallies)
         self.assertEqual(REPORT.commit_link("unknown"), "`unknown`")
 
 

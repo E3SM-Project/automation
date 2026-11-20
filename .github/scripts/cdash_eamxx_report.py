@@ -68,6 +68,7 @@ from collections import Counter, deque
 CDASH = "https://my.cdash.org"
 PROJECT = "E3SM"
 GITHUB_REPO = "https://github.com/E3SM-Project/E3SM"  # for linking commit shas
+GITHUB_API_REPO = "https://api.github.com/repos/E3SM-Project/E3SM"
 
 # ---------------------------------------------------------------------------
 # Configuration: which build groups to report and how to filter their tests.
@@ -95,6 +96,7 @@ MAX_SUITE_AGE_HOURS = 18
 MAX_SUITE_AGE_SECONDS = MAX_SUITE_AGE_HOURS * 60 * 60
 
 BLESS_RE = re.compile(r"Most recent bless:\s*sha:(\S+)\s+date:(\S+)")
+MERGE_PR_RE = re.compile(r"^Merge pull request #(\d+)\b")
 FIELDLIST_RE = re.compile(r"master:\s*FIELDLIST field lists differ \(otherwise bit-for-bit\)")
 BFAIL_BASELINE_RE = re.compile(r"master:\s*ERROR BFAIL baseline directory [^\r\n]* does not exist")
 DIFF_DIAGNOSTICS = {
@@ -179,6 +181,40 @@ def classify(t, build_error_text):
     return "FAIL"
 
 
+def github_repo_json(path):
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "e3sm-cdash-eamxx-bot"}
+    if token := os.environ.get("GITHUB_TOKEN"):
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(f"{GITHUB_API_REPO}/{path}", headers=headers)
+    with urllib.request.urlopen(req, timeout=10) as response:
+        return json.load(response)
+
+
+def lookup_merge_pr(sha):
+    """Find a merge PR in an E3SM commit headline; absent/unavailable means use the SHA."""
+    if not re.fullmatch(r"[0-9a-fA-F]{7,40}", sha):
+        return None
+    try:
+        message = github_repo_json(f"commits/{sha}")["commit"]["message"]
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        print(f"Could not look up baseline commit {sha}: {error}", file=sys.stderr)
+        return None
+    match = MERGE_PR_RE.match(message) if isinstance(message, str) else None
+    return match.group(1) if match else None
+
+
+def lookup_pr_title(pr_number):
+    """Return the PR's title as a single line, or None if it is unavailable."""
+    try:
+        title = github_repo_json(f"pulls/{pr_number}")["title"]
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        print(f"Could not look up E3SM PR #{pr_number}: {error}", file=sys.stderr)
+        return None
+    if not isinstance(title, str):
+        return None
+    return " ".join(title.split()) or None
+
+
 # --------------------------------------------------------------------------- collect
 def collect(date, now=None, profile=PROFILE_ALL):
     if profile not in PROFILES:
@@ -190,6 +226,8 @@ def collect(date, now=None, profile=PROFILE_ALL):
     cutoff = (time.time() if now is None else now) - MAX_SUITE_AGE_SECONDS
     by_name = {g["name"]: g for g in index.get("buildgroups", [])}
 
+    pr_by_sha = {}
+    title_by_pr = {}
     for gname, mode in GROUPS.items():
         g = by_name.get(gname)
         group = {"name": gname, "mode": mode, "builds": [], "missing": g is None,
@@ -246,6 +284,16 @@ def collect(date, now=None, profile=PROFILE_ALL):
 
             for t in tests:
                 t["bucket"] = classify(t, be_text)
+                if t["bucket"] == "DIFF" and t.get("bless"):
+                    sha = t["bless"][0]
+                    if sha not in pr_by_sha:
+                        pr_by_sha[sha] = lookup_merge_pr(sha)
+                    t["baseline_pr"] = pr_by_sha[sha]
+                    if t["baseline_pr"]:
+                        pr_number = t["baseline_pr"]
+                        if pr_number not in title_by_pr:
+                            title_by_pr[pr_number] = lookup_pr_title(pr_number)
+                        t["baseline_pr_title"] = title_by_pr[pr_number]
             triage_build_tests(b["id"], tests)
 
             # Build errors not tied to any test (e.g. a unit-test build that failed to
@@ -784,6 +832,12 @@ def commit_link(sha, slack=False):
     return label
 
 
+def baseline_link(sha, pr_number, slack=False):
+    if pr_number:
+        return f"<{GITHUB_REPO}/pull/{pr_number}|Merge PR #{pr_number}>"
+    return f"sha {commit_link(sha, slack)}"
+
+
 def counts_str(c, show_zero=("PASS", "FAIL", "BUILDFAIL", "DIFF")):
     summary_order = ("FAIL", "BUILDFAIL", "DIFF", "PASS", "NOTRUN")
     parts = [f"{LABEL[k]} {c[k]:,}" for k in summary_order if c[k] or k in show_zero]
@@ -834,7 +888,10 @@ def format_diff_tallies(diffs, slack=False):
         baseline, diagnostics = signature
         if baseline[0] == "bless":
             _, sha = baseline
-            info = f"sha {commit_link(sha, slack)}"
+            baseline_test = diffs[first_seen[signature]]
+            info = baseline_link(sha, baseline_test.get("baseline_pr"), slack)
+            if title := baseline_test.get("baseline_pr_title"):
+                info += f" · {display(title, slack)}"
             days = bless_days[signature]
             if days - {None}:
                 info += f" · blessed {', '.join(sorted(days - {None}))}"

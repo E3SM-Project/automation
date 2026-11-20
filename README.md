@@ -70,7 +70,14 @@ details in a thread, and the full report as a file); without them it uses the
 webhook above. The Slack summary shows each test group and the section total in
 an aligned, monospaced count table, including suites needing attention. Build
 errors without a failed test are counted separately and link to the affected
-suite; they are not included in the test counts:
+suite; they are not included in the test counts.
+
+For baseline DIFFs, the report links to the E3SM merge PR and shows its title
+when the bless SHA's commit headline identifies one; otherwise it links to the
+commit SHA. GitHub lookups are cached per report. Local runs can omit
+`GITHUB_TOKEN`; unavailable lookups fall back to the commit link or PR number.
+
+Slack bot settings:
 
 | Name | Kind | What it is |
 | --- | --- | --- |
